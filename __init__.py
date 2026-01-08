@@ -2,7 +2,6 @@ import bpy
 import sys
 import os
 
-# --- Dependency Loader ---
 def import_dependencies():
     addon_dir = os.path.dirname(os.path.realpath(__file__))
     wheels_path = os.path.join(addon_dir, "wheels")
@@ -13,42 +12,24 @@ def import_dependencies():
     except ImportError:
         return False
 
-# Load immediately
 dependencies_loaded = import_dependencies()
 from . import MidiControl
 
 # --- Dynamic Device List ---
 def get_midi_devices(self, context):
-    """
-    Callback to populate the EnumProperty with detected MIDI ports.
-    """
     items = []
-    
     if not dependencies_loaded:
-        return [('NONE', "Dependencies Missing", "Check console for errors")]
-
+        return [('NONE', "Dependencies Missing", "Check console")]
     try:
         import mido
-        # Get list of input names
         devices = mido.get_input_names()
-        
-        # Format: (identifier, name, description)
-        for dev in devices:
-            # We use the device name as the identifier
-            items.append((dev, dev, "MIDI Device"))
-            
-        if not items:
-            items.append(('NONE', "No Devices Found", "Plug in a device and try again"))
-            
+        for dev in devices: items.append((dev, dev, "MIDI Device"))
+        if not items: items.append(('NONE', "No Devices Found", ""))
     except Exception as e:
         items.append(('ERROR', "Error Scanning", str(e)))
-        
     return items
 
 def update_device_selection(self, context):
-    """
-    When the Dropdown changes, copy the value to the 'Real' device name string.
-    """
     if self.midi_device_enum != 'NONE' and self.midi_device_enum != 'ERROR':
         self.midi_device_name = self.midi_device_enum
 
@@ -56,10 +37,33 @@ def update_device_selection(self, context):
 class MidiMapping(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(name="Name", default="New Mapping")
     data_path: bpy.props.StringProperty(name="Data Path", description="Right-click property -> Copy Full Data Path")
-    midi_cc: bpy.props.IntProperty(name="ID", default=0, min=0, max=127, description="CC Number or Note Number")
-    use_note: bpy.props.BoolProperty(name="Use Note/Key", default=False, description="Enable if using a Keyboard Key (Note) instead of a Knob (CC)")
-    min_value: bpy.props.FloatProperty(name="Min / Release", default=0.0)
-    max_value: bpy.props.FloatProperty(name="Max / Press", default=1.0)
+    midi_cc: bpy.props.IntProperty(name="ID", default=0, min=0, max=127)
+    use_note: bpy.props.BoolProperty(name="Use Note/Key", default=False)
+    
+    # Internal property to store the "Goal" value from MIDI
+    target_value: bpy.props.FloatProperty(default=0.0)
+
+    # --- Interpolation Settings ---
+    smooth_speed: bpy.props.FloatProperty(
+        name="Speed", 
+        default=0.1, min=0.01, max=1.0, 
+        description="Animation Speed. 0.01 = Slow Fade, 1.0 = Instant"
+    )
+    
+    easing_mode: bpy.props.EnumProperty(
+        name="Curve",
+        description="Shape of the transition",
+        items=[
+            ('LINEAR', "Linear", "Steady speed"),
+            ('EASE_IN', "Ease In", "Starts slow"),
+            ('EASE_OUT', "Ease Out", "Ends slow"),
+            ('SMOOTHSTEP', "Smoothstep", "S-Curve"),
+        ],
+        default='LINEAR'
+    )
+    
+    min_value: bpy.props.FloatProperty(name="Min", default=0.0)
+    max_value: bpy.props.FloatProperty(name="Max", default=1.0)
 
 # --- UI Panel ---
 class OBJECT_PT_MidiController(bpy.types.Panel):
@@ -73,59 +77,57 @@ class OBJECT_PT_MidiController(bpy.types.Panel):
         layout = self.layout
         scene = context.scene
         
-        # --- Connection ---
+        # Connection
         box = layout.box()
         box.label(text="Connection")
-        
-        # Row for Device Selection
         row = box.row(align=True)
-        
         if scene.use_manual_device_name:
-            # TEXT MODE
             row.prop(scene, "midi_device_name", text="")
-            # Button to switch back to Dropdown
-            row.prop(scene, "use_manual_device_name", text="", icon='Unpinned', toggle=True)
+            row.prop(scene, "use_manual_device_name", text="", icon='UNPINNED', toggle=True)
         else:
-            # DROPDOWN MODE
             row.prop(scene, "midi_device_enum", text="")
-            # Button to switch to Manual Text
             row.prop(scene, "use_manual_device_name", text="", icon='GREASEPENCIL', toggle=True)
-
-        # Connect Button
         box.operator("wm.midi_connect", text="Connect", icon='NODE_COMPOSITING')
 
-        # --- MIDI MONITOR ---
+        # Monitor
         box = layout.box()
-        box.label(text="Monitor (Last Signal)", icon='SOUND')
-        
+        box.label(text="Monitor", icon='SOUND')
         if scene.monitor_id == -1:
-            box.label(text="Waiting for signal...", icon='TIME')
+            box.label(text="Waiting...", icon='TIME')
         else:
-            signal_name = f"{scene.monitor_type} #{scene.monitor_id}"
             row = box.row()
-            row.label(text=signal_name)
+            row.label(text=f"{scene.monitor_type} #{scene.monitor_id}")
             row.label(text=f"Val: {int(scene.monitor_val)}")
-            if scene.monitor_type == "Note":
-                box.label(text="Tip: Check 'Use Note/Key'!", icon='INFO')
 
-        # --- Mappings ---
+        # Mappings
         layout.label(text="Mappings")
         for index, mapping in enumerate(scene.midi_mappings):
             box = layout.box()
+            
+            # Header
             row = box.row()
             row.prop(mapping, "name", text="")
             row.operator("wm.midi_remove_mapping", text="", icon='X').index = index
             
+            # Path
             col = box.column()
             col.prop(mapping, "data_path", text="Path")
             
+            # ID and Type
             row = box.row()
-            row.prop(mapping, "midi_cc", text="ID (CC/Note)")
+            row.prop(mapping, "midi_cc", text="ID")
             row.prop(mapping, "use_note", text="Key Mode")
-            
+
+            # Animation Controls (Highlighted)
+            sub = box.column(align=True)
+            row = sub.row(align=True)
+            row.prop(mapping, "easing_mode", text="")
+            row.prop(mapping, "smooth_speed", text="Speed")
+
+            # Range
             row = box.row(align=True)
-            row.prop(mapping, "min_value", text="Min/Off")
-            row.prop(mapping, "max_value", text="Max/On")
+            row.prop(mapping, "min_value", text="Min")
+            row.prop(mapping, "max_value", text="Max")
 
         layout.separator()
         layout.operator("wm.midi_add_mapping", text="Add Mapping", icon='ADD')
@@ -136,15 +138,13 @@ class MIDI_OT_Connect(bpy.types.Operator):
     bl_label = "Connect MIDI"
     def execute(self, context):
         device = context.scene.midi_device_name
-        
         if device == "" or device == "NONE":
-            self.report({'ERROR'}, "Please select or type a valid device name")
+            self.report({'ERROR'}, "Select a device")
             return {'CANCELLED'}
-
         if MidiControl.start_listening(device):
             self.report({'INFO'}, f"Connected to {device}")
         else:
-            self.report({'ERROR'}, f"Failed to connect. Check name.")
+            self.report({'ERROR'}, f"Failed to connect")
         return {'FINISHED'}
 
 class MIDI_OT_AddMapping(bpy.types.Operator):
@@ -167,26 +167,10 @@ classes = (MidiMapping, OBJECT_PT_MidiController, MIDI_OT_Connect, MIDI_OT_AddMa
 
 def register():
     for cls in classes: bpy.utils.register_class(cls)
-    
     bpy.types.Scene.midi_mappings = bpy.props.CollectionProperty(type=MidiMapping)
-    
-    # The 'Real' Name used by the backend
     bpy.types.Scene.midi_device_name = bpy.props.StringProperty(name="Device", default="")
-    
-    # The Dropdown (Enum) used by the UI
-    bpy.types.Scene.midi_device_enum = bpy.props.EnumProperty(
-        name="Device List",
-        description="Available MIDI Devices",
-        items=get_midi_devices,
-        update=update_device_selection
-    )
-    
-    # Toggle between Text Box and Dropdown
-    bpy.types.Scene.use_manual_device_name = bpy.props.BoolProperty(
-        name="Manual Entry",
-        description="Switch between Dropdown list and Manual Text Entry",
-        default=False
-    )
+    bpy.types.Scene.midi_device_enum = bpy.props.EnumProperty(name="Device List", items=get_midi_devices, update=update_device_selection)
+    bpy.types.Scene.use_manual_device_name = bpy.props.BoolProperty(default=False)
     
     # Monitor Props
     bpy.types.Scene.monitor_type = bpy.props.StringProperty(name="Type", default="None")

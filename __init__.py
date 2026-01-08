@@ -79,19 +79,46 @@ def resolve_path(path):
     except Exception:
         return None, None, None
 
+# --- RESTORED FULL EASING FUNCTIONS ---
 def apply_easing(t, mode):
     # Clamp input time
     if t < 0: t = 0
     if t > 1: t = 1
     
     if mode == 'LINEAR': return t
+    
+    # Quadratic
+    elif mode == 'QUAD_IN': return t * t
+    elif mode == 'QUAD_OUT': return 1 - (1 - t) * (1 - t)
     elif mode == 'QUAD_INOUT': return 2 * t * t if t < 0.5 else 1 - math.pow(-2 * t + 2, 2) / 2
+    
+    # Cubic
+    elif mode == 'CUBIC_OUT': return 1 - math.pow(1 - t, 3)
+    
+    # Exponential
     elif mode == 'EXPO_OUT': return 1 if t == 1 else 1 - math.pow(2, -10 * t)
+    
+    # Back
+    elif mode == 'BACK_OUT':
+        c1 = 1.70158
+        c3 = c1 + 1
+        return 1 + c3 * math.pow(t - 1, 3) + c1 * math.pow(t - 1, 2)
+        
+    # Elastic
+    elif mode == 'ELASTIC_OUT':
+        if t == 0: return 0
+        if t == 1: return 1
+        c4 = (2 * math.pi) / 3
+        return math.pow(2, -10 * t) * math.sin((t * 10 - 0.75) * c4) + 1
+
+    # Bounce
     elif mode == 'BOUNCE_OUT':
         n1 = 7.5625; d1 = 2.75
         if t < 1 / d1: return n1 * t * t
         elif t < 2 / d1: t -= 1.5 / d1; return n1 * t * t + 0.75
+        elif t < 2.5 / d1: t -= 2.25 / d1; return n1 * t * t + 0.9375
         else: t -= 2.625 / d1; return n1 * t * t + 0.984375
+
     return t
 
 def apply_to_blender(target, normalized_value, use_absolute):
@@ -252,9 +279,21 @@ class MidiMapping(bpy.types.PropertyGroup):
     targets: bpy.props.CollectionProperty(type=MidiTarget)
     use_absolute: bpy.props.BoolProperty(name="Abs", default=False)
     smooth_speed: bpy.props.FloatProperty(name="Speed", default=0.1, min=0.01, max=1.0)
+    
+    # --- RESTORED ENUM LIST ---
     easing_mode: bpy.props.EnumProperty(
         name="Curve",
-        items=[('LINEAR', "Linear", ""), ('QUAD_INOUT', "Smooth", ""), ('EXPO_OUT', "Sharp", ""), ('BOUNCE_OUT', "Bounce", "")],
+        items=[
+            ('LINEAR', "Linear", "Steady speed"),
+            ('QUAD_IN', "Quad In", "Slow start"),
+            ('QUAD_OUT', "Quad Out", "Slow end"),
+            ('QUAD_INOUT', "Quad In/Out", "Slow start and end"),
+            ('CUBIC_OUT', "Cubic Out", "Slower end"),
+            ('EXPO_OUT', "Expo Out", "Very sharp snap"),
+            ('BACK_OUT', "Back Out", "Overshoot"),
+            ('ELASTIC_OUT', "Elastic Out", "Wobbly"),
+            ('BOUNCE_OUT', "Bounce Out", "Bounce"),
+        ],
         default='LINEAR'
     )
 

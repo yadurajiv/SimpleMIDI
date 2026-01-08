@@ -24,9 +24,9 @@ dependencies_loaded = import_dependencies()
 execution_queue = queue.SimpleQueue()
 animation_states = {}
 midi_input = None
+is_connected = False  # Track connection state
 
 def robust_path_split(path):
-    """ Splits path ignoring dots inside brackets/quotes. """
     parts = []
     current = ""
     in_quote = False
@@ -79,46 +79,29 @@ def resolve_path(path):
     except Exception:
         return None, None, None
 
-# --- RESTORED FULL EASING FUNCTIONS ---
 def apply_easing(t, mode):
-    # Clamp input time
     if t < 0: t = 0
     if t > 1: t = 1
-    
     if mode == 'LINEAR': return t
-    
-    # Quadratic
     elif mode == 'QUAD_IN': return t * t
     elif mode == 'QUAD_OUT': return 1 - (1 - t) * (1 - t)
     elif mode == 'QUAD_INOUT': return 2 * t * t if t < 0.5 else 1 - math.pow(-2 * t + 2, 2) / 2
-    
-    # Cubic
     elif mode == 'CUBIC_OUT': return 1 - math.pow(1 - t, 3)
-    
-    # Exponential
     elif mode == 'EXPO_OUT': return 1 if t == 1 else 1 - math.pow(2, -10 * t)
-    
-    # Back
     elif mode == 'BACK_OUT':
-        c1 = 1.70158
-        c3 = c1 + 1
+        c1 = 1.70158; c3 = c1 + 1
         return 1 + c3 * math.pow(t - 1, 3) + c1 * math.pow(t - 1, 2)
-        
-    # Elastic
     elif mode == 'ELASTIC_OUT':
         if t == 0: return 0
         if t == 1: return 1
         c4 = (2 * math.pi) / 3
         return math.pow(2, -10 * t) * math.sin((t * 10 - 0.75) * c4) + 1
-
-    # Bounce
     elif mode == 'BOUNCE_OUT':
         n1 = 7.5625; d1 = 2.75
         if t < 1 / d1: return n1 * t * t
         elif t < 2 / d1: t -= 1.5 / d1; return n1 * t * t + 0.75
         elif t < 2.5 / d1: t -= 2.25 / d1; return n1 * t * t + 0.9375
         else: t -= 2.625 / d1; return n1 * t * t + 0.984375
-
     return t
 
 def apply_to_blender(target, normalized_value, use_absolute):
@@ -133,14 +116,12 @@ def apply_to_blender(target, normalized_value, use_absolute):
     target.current_val_display = final_val
 
     try:
-        # Set Value
         if index != -1:
             current_vector = getattr(obj, prop_name)
             current_vector[index] = final_val
         else:
             setattr(obj, prop_name, final_val)
             
-        # AUTO KEYING (Only runs if Record is ON)
         if bpy.context.scene.tool_settings.use_keyframe_insert_auto:
             obj.keyframe_insert(data_path=prop_name, index=index if index != -1 else -1)
             
@@ -177,17 +158,14 @@ def queue_processor():
 
     # 2. ANIMATION LOOP
     for i, mapping in enumerate(scene.midi_mappings):
-        # Init state
         if i not in animation_states: animation_states[i] = mapping.target_value
         
-        # Get Previous and Target
         prev_val = animation_states[i]
         target = mapping.target_value
         current = prev_val
         
-        # Math Step
         if abs(current - target) < 0.001:
-            current = target # Snap to finish
+            current = target
         else:
             speed = mapping.smooth_speed
             step = speed * 0.2 if speed < 1.0 else 1.0
@@ -198,19 +176,12 @@ def queue_processor():
                 current -= step
                 if current < target: current = target
         
-        # --- OPTIMIZATION FIX ---
-        # Only apply/keyframe if the value actually CHANGED
         if abs(current - prev_val) > 0.00001:
-            
-            # Update State
             animation_states[i] = current
-            
-            # Apply to Blender
             curved_val = apply_easing(current, mapping.easing_mode)
             for target in mapping.targets:
                 apply_to_blender(target, curved_val, mapping.use_absolute)
         
-    # 3. REDRAW
     for window in bpy.context.window_manager.windows:
         for area in window.screen.areas:
             if area.type == 'VIEW_3D':
@@ -220,20 +191,24 @@ def queue_processor():
 
 def start_listening(port_name):
     import mido
+    global midi_input, is_connected
     try:
         stop_listening()
-        global midi_input
         midi_input = mido.open_input(port_name, callback=midi_callback)
+        is_connected = True
         if not bpy.app.timers.is_registered(queue_processor):
             bpy.app.timers.register(queue_processor)
         return True
-    except: return False
+    except: 
+        is_connected = False
+        return False
 
 def stop_listening():
-    global midi_input
+    global midi_input, is_connected
     if 'midi_input' in globals() and midi_input:
         midi_input.close()
         midi_input = None
+    is_connected = False
     if bpy.app.timers.is_registered(queue_processor):
         bpy.app.timers.unregister(queue_processor)
 
@@ -277,10 +252,13 @@ class MidiMapping(bpy.types.PropertyGroup):
     use_note: bpy.props.BoolProperty(name="Key Mode", default=False)
     target_value: bpy.props.FloatProperty(default=0.0)
     targets: bpy.props.CollectionProperty(type=MidiTarget)
+    
+    # New Toggle for UI Collapse
+    show_expanded: bpy.props.BoolProperty(name="Show Details", default=True)
+    
     use_absolute: bpy.props.BoolProperty(name="Abs", default=False)
     smooth_speed: bpy.props.FloatProperty(name="Speed", default=0.1, min=0.01, max=1.0)
     
-    # --- RESTORED ENUM LIST ---
     easing_mode: bpy.props.EnumProperty(
         name="Curve",
         items=[
@@ -307,52 +285,94 @@ class OBJECT_PT_MidiController(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
+        global is_connected
         
+        # --- CONNECTION PANEL ---
         box = layout.box()
+        
+        # Device Selector
         row = box.row(align=True)
-        row.prop(scene, "midi_device_enum", text="")
-        row.operator("wm.midi_connect", text="Connect", icon='NODE_COMPOSITING')
-
+        if not is_connected:
+            row.prop(scene, "midi_device_enum", text="")
+        else:
+            row.label(text=f"Connected: {scene.midi_device_name}", icon='CHECKBOX_HLT')
+        
+        # Connect / Disconnect Button Logic
+        if not is_connected:
+            # Green Connect Button
+            row.operator("wm.midi_connect", text="Connect", icon='PLAY') 
+        else:
+            # Red Disconnect Button
+            btn = row.operator("wm.midi_disconnect", text="Disconnect", icon='PAUSE')
+            row.alert = True # Turns the row/button red
+            
+        # --- MONITOR PANEL ---
         box = layout.box()
-        if scene.monitor_id == -1: box.label(text="Monitor: Waiting...", icon='SOUND')
-        else: box.label(text=f"Monitor: {scene.monitor_type} #{scene.monitor_id} (Val: {int(scene.monitor_val)})", icon='SOUND')
+        if not is_connected:
+            box.label(text="Status: Disconnected", icon='cancel')
+        elif scene.monitor_id == -1: 
+            box.label(text="Monitor: Waiting for signal...", icon='SOUND')
+        else: 
+            box.label(text=f"Monitor: {scene.monitor_type} #{scene.monitor_id} (Val: {int(scene.monitor_val)})", icon='SOUND')
 
+        # --- IMPORT / EXPORT ---
         row = box.row(align=True)
         row.operator("wm.midi_export_json", text="Export", icon='EXPORT')
         row.operator("wm.midi_import_json", text="Import", icon='IMPORT')
 
+        # --- MAPPINGS LIST ---
         layout.label(text="Mappings")
+        
         for index, mapping in enumerate(scene.midi_mappings):
             box = layout.box()
-            row = box.row()
+            
+            # --- HEADER (Always Visible) ---
+            # Contains: Collapse Icon | Name | Duplicate | Delete
+            row = box.row(align=True)
+            
+            # Collapse Arrow
+            icon = 'TRIA_DOWN' if mapping.show_expanded else 'TRIA_RIGHT'
+            row.prop(mapping, "show_expanded", text="", icon=icon, emboss=False)
+            
+            # Name (Editable)
             row.prop(mapping, "name", text="")
+            
+            # Buttons (Duplicate & Remove)
+            row.operator("wm.midi_duplicate_mapping", text="", icon='DUPLICATE').index = index
             row.operator("wm.midi_remove_mapping", text="", icon='X').index = index
             
-            row = box.row(align=True)
-            row.prop(mapping, "midi_cc", text="ID")
-            row.prop(mapping, "use_note", text="Key")
-            row.prop(mapping, "use_absolute", text="Abs")
-            
-            sub = box.column(align=True)
-            row = sub.row(align=True)
-            row.prop(mapping, "easing_mode", text="")
-            row.prop(mapping, "smooth_speed", text="Speed")
+            # --- EXPANDED DETAILS ---
+            if mapping.show_expanded:
+                col = box.column()
+                
+                # Main Settings
+                row = col.row(align=True)
+                row.prop(mapping, "midi_cc", text="ID")
+                row.prop(mapping, "use_note", text="Key")
+                row.prop(mapping, "use_absolute", text="Abs")
+                
+                # Animation Settings
+                row = col.row(align=True)
+                row.prop(mapping, "easing_mode", text="")
+                row.prop(mapping, "smooth_speed", text="Speed")
 
-            col = box.column(align=True)
-            col.label(text="Targets:")
-            for t_index, target in enumerate(mapping.targets):
-                t_box = col.box()
-                t_row = t_box.row()
-                t_row.prop(target, "data_path", text="")
-                t_row.operator("wm.midi_remove_target", text="", icon='REMOVE').mapping_index = index
-                t_row = t_box.row(align=True)
-                if not mapping.use_absolute:
-                    t_row.prop(target, "min_value", text="Min")
-                    t_row.prop(target, "max_value", text="Max")
-                else:
-                    t_row.label(text="(Absolute Mode)")
+                # Targets List
+                t_col = col.column(align=True)
+                t_col.label(text="Targets:")
+                for t_index, target in enumerate(mapping.targets):
+                    t_box = t_col.box()
+                    t_row = t_box.row()
+                    t_row.prop(target, "data_path", text="")
+                    t_row.operator("wm.midi_remove_target", text="", icon='REMOVE').mapping_index = index
+                    
+                    t_row = t_box.row(align=True)
+                    if not mapping.use_absolute:
+                        t_row.prop(target, "min_value", text="Min")
+                        t_row.prop(target, "max_value", text="Max")
+                    else:
+                        t_row.label(text="(Absolute Value Mode)")
 
-            col.operator("wm.midi_add_target", text="Add Target", icon='ADD').mapping_index = index
+                col.operator("wm.midi_add_target", text="Add Target", icon='ADD').mapping_index = index
 
         layout.operator("wm.midi_add_mapping", text="New Mapping", icon='ADD')
 
@@ -366,6 +386,14 @@ class MIDI_OT_Connect(bpy.types.Operator):
         else: self.report({'ERROR'}, "Failed")
         return {'FINISHED'}
 
+class MIDI_OT_Disconnect(bpy.types.Operator):
+    bl_idname = "wm.midi_disconnect"
+    bl_label = "Disconnect"
+    def execute(self, context):
+        stop_listening()
+        self.report({'INFO'}, "Disconnected")
+        return {'FINISHED'}
+
 class MIDI_OT_AddMapping(bpy.types.Operator):
     bl_idname = "wm.midi_add_mapping"
     bl_label = "Add Mapping"
@@ -376,6 +404,31 @@ class MIDI_OT_AddMapping(bpy.types.Operator):
             new_map.use_note = (context.scene.monitor_type == 'Note')
             new_map.name = f"{context.scene.monitor_type} {context.scene.monitor_id}"
         new_map.targets.add()
+        return {'FINISHED'}
+
+class MIDI_OT_DuplicateMapping(bpy.types.Operator):
+    bl_idname = "wm.midi_duplicate_mapping"
+    bl_label = "Duplicate"
+    index: bpy.props.IntProperty()
+    def execute(self, context):
+        src = context.scene.midi_mappings[self.index]
+        new_map = context.scene.midi_mappings.add()
+        
+        # Copy Attributes
+        new_map.name = src.name + " Copy"
+        new_map.midi_cc = src.midi_cc
+        new_map.use_note = src.use_note
+        new_map.use_absolute = src.use_absolute
+        new_map.smooth_speed = src.smooth_speed
+        new_map.easing_mode = src.easing_mode
+        
+        # Copy Targets
+        for t in src.targets:
+            new_t = new_map.targets.add()
+            new_t.data_path = t.data_path
+            new_t.min_value = t.min_value
+            new_t.max_value = t.max_value
+            
         return {'FINISHED'}
 
 class MIDI_OT_RemoveMapping(bpy.types.Operator):
@@ -454,7 +507,7 @@ class MIDI_OT_ImportJSON(bpy.types.Operator, ImportHelper):
                 else: nt.data_path = raw_path
         return {'FINISHED'}
 
-classes = (MidiTarget, MidiMapping, OBJECT_PT_MidiController, MIDI_OT_Connect, MIDI_OT_AddMapping, MIDI_OT_RemoveMapping, MIDI_OT_AddTarget, MIDI_OT_RemoveTarget, MIDI_OT_ExportJSON, MIDI_OT_ImportJSON)
+classes = (MidiTarget, MidiMapping, OBJECT_PT_MidiController, MIDI_OT_Connect, MIDI_OT_Disconnect, MIDI_OT_AddMapping, MIDI_OT_DuplicateMapping, MIDI_OT_RemoveMapping, MIDI_OT_AddTarget, MIDI_OT_RemoveTarget, MIDI_OT_ExportJSON, MIDI_OT_ImportJSON)
 
 def register():
     for cls in classes: bpy.utils.register_class(cls)

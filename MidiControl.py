@@ -2,62 +2,36 @@ import bpy
 import queue
 import math
 
-# Thread-safe queue for incoming MIDI signals
+# Thread-safe queue
 execution_queue = queue.SimpleQueue()
 animation_states = {}
 
-# --- Advanced Easing Functions (Source: easings.net) ---
+# --- Easing Functions ---
 def apply_easing(t, mode):
-    # Clamp
     if t < 0: t = 0
     if t > 1: t = 1
-    
-    # 1. Standard
     if mode == 'LINEAR': return t
-    
-    # 2. Quadratic (Power of 2)
     elif mode == 'QUAD_IN': return t * t
     elif mode == 'QUAD_OUT': return 1 - (1 - t) * (1 - t)
-    elif mode == 'QUAD_INOUT': 
-        return 2 * t * t if t < 0.5 else 1 - math.pow(-2 * t + 2, 2) / 2
-
-    # 3. Cubic (Power of 3)
-    elif mode == 'CUBIC_IN': return t * t * t
+    elif mode == 'QUAD_INOUT': return 2 * t * t if t < 0.5 else 1 - math.pow(-2 * t + 2, 2) / 2
     elif mode == 'CUBIC_OUT': return 1 - math.pow(1 - t, 3)
-    
-    # 4. Exponential (Sharp curve)
-    elif mode == 'EXPO_IN': return 0 if t == 0 else math.pow(2, 10 * t - 10)
     elif mode == 'EXPO_OUT': return 1 if t == 1 else 1 - math.pow(2, -10 * t)
-    
-    # 5. Back (Overshoot)
     elif mode == 'BACK_OUT':
         c1 = 1.70158
         c3 = c1 + 1
         return 1 + c3 * math.pow(t - 1, 3) + c1 * math.pow(t - 1, 2)
-
-    # 6. Elastic (Rubber band)
     elif mode == 'ELASTIC_OUT':
         if t == 0: return 0
         if t == 1: return 1
         c4 = (2 * math.pi) / 3
         return math.pow(2, -10 * t) * math.sin((t * 10 - 0.75) * c4) + 1
-
-    # 7. Bounce (Ball dropping)
     elif mode == 'BOUNCE_OUT':
         n1 = 7.5625
         d1 = 2.75
-        if t < 1 / d1:
-            return n1 * t * t
-        elif t < 2 / d1:
-            t -= 1.5 / d1
-            return n1 * t * t + 0.75
-        elif t < 2.5 / d1:
-            t -= 2.25 / d1
-            return n1 * t * t + 0.9375
-        else:
-            t -= 2.625 / d1
-            return n1 * t * t + 0.984375
-
+        if t < 1 / d1: return n1 * t * t
+        elif t < 2 / d1: t -= 1.5 / d1; return n1 * t * t + 0.75
+        elif t < 2.5 / d1: t -= 2.25 / d1; return n1 * t * t + 0.9375
+        else: t -= 2.625 / d1; return n1 * t * t + 0.984375
     return t
 
 def resolve_path(path):
@@ -81,24 +55,22 @@ def resolve_path(path):
         else:
             prop_name = last_part
         return obj, prop_name, index
-    except Exception:
-        return None, None, None
+    except Exception: return None, None, None
 
 def apply_to_blender(mapping, normalized_value):
     obj, prop_name, index = resolve_path(mapping.data_path)
     
-    # Determine Output Value
+    # --- LOGIC CHECK ---
     if mapping.use_absolute:
-        # Absolute Mode: Scale normalized (0-1) back to MIDI range (0-127)
-        # Note: If this is a velocity note, normalized_value is already velocity/127
+        # ABSOLUTE MODE: 
+        # normalized_value is 0.0 to 1.0. 
+        # Multiply by 127 to get the raw MIDI value (e.g. 64.0, 127.0).
         final_val = normalized_value * 127.0
     else:
-        # Standard Mode: Scale between User Min/Max
+        # STANDARD MODE:
+        # Scale between User Min and Max
         final_val = mapping.min_value + (normalized_value * (mapping.max_value - mapping.min_value))
     
-    # Store the Calculated Value for UI Display
-    mapping.current_output_value = final_val
-
     if obj is None: return
 
     try:
@@ -133,12 +105,11 @@ def queue_processor():
         for mapping in scene.midi_mappings:
             if mapping.midi_cc == m_id:
                 if mapping.use_note:
-                    # Note Mode logic
                     if m_type == 'Note':
                         mapping.target_value = 1.0 if m_val > 0 else 0.0
                 else:
-                    # CC Mode logic
                     if m_type != 'Note':
+                        # Always normalize to 0-1 first for consistent animation math
                         mapping.target_value = m_val / 127.0
 
     # 2. Animation Loop
@@ -148,10 +119,12 @@ def queue_processor():
         current = animation_states[i]
         target = mapping.target_value
         
+        # Optimization: Stop calculating if we are close enough
         if abs(current - target) < 0.001:
             current = target
         else:
             speed = mapping.smooth_speed
+            # Calculate step based on speed (non-linear feel)
             step = speed * 0.2 if speed < 1.0 else 1.0
             
             if current < target:
@@ -163,15 +136,17 @@ def queue_processor():
         
         animation_states[i] = current
         
-        # Apply Easing Curve
+        # Apply Curve -> Then Apply to Blender (which handles the Abs/MinMax scaling)
         curved_value = apply_easing(current, mapping.easing_mode)
         apply_to_blender(mapping, curved_value)
 
-    # Redraw
-    for win in bpy.context.window_manager.windows:
-        for area in win.screen.areas:
-            if area.type == 'VIEW_3D' or area.type == 'PROPERTIES':
-                area.tag_redraw()
+    # 3. Force UI Redraw
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == 'VIEW_3D':
+                for region in area.regions:
+                    if region.type == 'UI':
+                        region.tag_redraw()
 
     return 0.016 
 

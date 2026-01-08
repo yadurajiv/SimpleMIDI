@@ -18,13 +18,11 @@ from . import MidiControl
 # --- Auto-Select Handler ---
 @persistent
 def auto_select_device(dummy):
-    """ Runs on startup to auto-select the first MIDI device """
     if not dependencies_loaded: return
     try:
         import mido
         devices = mido.get_input_names()
         if devices and bpy.context.scene.midi_device_name == "":
-            print(f"MidiController: Auto-selecting {devices[0]}")
             bpy.context.scene.midi_device_name = devices[0]
             bpy.context.scene.midi_device_enum = devices[0]
     except: pass
@@ -46,16 +44,15 @@ def update_device_selection(self, context):
 
 class MidiMapping(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(name="Name", default="New Mapping")
-    data_path: bpy.props.StringProperty(name="Data Path", description="Right-click property -> Copy Full Data Path")
+    data_path: bpy.props.StringProperty(name="Data Path")
     midi_cc: bpy.props.IntProperty(name="ID", default=0, min=0, max=127)
     use_note: bpy.props.BoolProperty(name="Use Note/Key", default=False)
     
-    # Logic
+    # Internal
     target_value: bpy.props.FloatProperty(default=0.0)
-    current_output_value: bpy.props.FloatProperty(default=0.0) # For UI Display
     
     # Settings
-    use_absolute: bpy.props.BoolProperty(name="Abs", description="Use raw MIDI value (0-127) instead of Min/Max range", default=False)
+    use_absolute: bpy.props.BoolProperty(name="Abs", description="Use raw MIDI value (0-127)", default=False)
     smooth_speed: bpy.props.FloatProperty(name="Speed", default=0.1, min=0.01, max=1.0)
     
     easing_mode: bpy.props.EnumProperty(
@@ -107,43 +104,38 @@ class OBJECT_PT_MidiController(bpy.types.Panel):
         else:
             row = box.row()
             row.label(text=f"{scene.monitor_type} #{scene.monitor_id}")
-            row.label(text=f"Val: {int(scene.monitor_val)}")
+            row.label(text=f"Raw: {int(scene.monitor_val)}")
 
         # Mappings
         layout.label(text="Mappings")
         for index, mapping in enumerate(scene.midi_mappings):
             box = layout.box()
             
-            # Header with Name + Value Display
+            # Header
             row = box.row()
             row.prop(mapping, "name", text="")
-            # Show live value
-            row.label(text=f"Val: {mapping.current_output_value:.2f}")
             row.operator("wm.midi_remove_mapping", text="", icon='X').index = index
             
             col = box.column()
             col.prop(mapping, "data_path", text="Path")
             
-            # ID | Key Mode | Absolute Toggle
             row = box.row(align=True)
             row.prop(mapping, "midi_cc", text="ID")
             row.prop(mapping, "use_note", text="Key")
             row.prop(mapping, "use_absolute", text="Abs")
 
-            # Animation
             sub = box.column(align=True)
             row = sub.row(align=True)
             row.prop(mapping, "easing_mode", text="")
             row.prop(mapping, "smooth_speed", text="Speed")
 
-            # Range (Only show if NOT Absolute)
             if not mapping.use_absolute:
                 row = box.row(align=True)
                 row.prop(mapping, "min_value", text="Min")
                 row.prop(mapping, "max_value", text="Max")
             else:
                 row = box.row()
-                row.label(text="Output: 0 - 127 (Absolute)", icon='INFO')
+                row.label(text="Output: 0 - 127", icon='INFO')
 
         layout.separator()
         layout.operator("wm.midi_add_mapping", text="Add Mapping", icon='ADD')

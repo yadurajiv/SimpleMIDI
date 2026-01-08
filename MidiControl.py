@@ -1,27 +1,65 @@
 import bpy
 import queue
-import time
+import math
 
 # Thread-safe queue for incoming MIDI signals
 execution_queue = queue.SimpleQueue()
-
-# Dictionary to store the current animated state of each mapping
-# Key: Mapping Index, Value: Current Normalized Value (0.0 to 1.0)
 animation_states = {}
 
-# --- Easing Functions ---
+# --- Advanced Easing Functions (Source: easings.net) ---
 def apply_easing(t, mode):
-    """ Transforms linear 0-1 progress into a curve """
+    # Clamp
     if t < 0: t = 0
     if t > 1: t = 1
     
+    # 1. Standard
     if mode == 'LINEAR': return t
-    elif mode == 'EASE_IN': return t * t
-    elif mode == 'EASE_OUT': return t * (2 - t)
-    elif mode == 'SMOOTHSTEP': return t * t * (3 - 2 * t)
+    
+    # 2. Quadratic (Power of 2)
+    elif mode == 'QUAD_IN': return t * t
+    elif mode == 'QUAD_OUT': return 1 - (1 - t) * (1 - t)
+    elif mode == 'QUAD_INOUT': 
+        return 2 * t * t if t < 0.5 else 1 - math.pow(-2 * t + 2, 2) / 2
+
+    # 3. Cubic (Power of 3)
+    elif mode == 'CUBIC_IN': return t * t * t
+    elif mode == 'CUBIC_OUT': return 1 - math.pow(1 - t, 3)
+    
+    # 4. Exponential (Sharp curve)
+    elif mode == 'EXPO_IN': return 0 if t == 0 else math.pow(2, 10 * t - 10)
+    elif mode == 'EXPO_OUT': return 1 if t == 1 else 1 - math.pow(2, -10 * t)
+    
+    # 5. Back (Overshoot)
+    elif mode == 'BACK_OUT':
+        c1 = 1.70158
+        c3 = c1 + 1
+        return 1 + c3 * math.pow(t - 1, 3) + c1 * math.pow(t - 1, 2)
+
+    # 6. Elastic (Rubber band)
+    elif mode == 'ELASTIC_OUT':
+        if t == 0: return 0
+        if t == 1: return 1
+        c4 = (2 * math.pi) / 3
+        return math.pow(2, -10 * t) * math.sin((t * 10 - 0.75) * c4) + 1
+
+    # 7. Bounce (Ball dropping)
+    elif mode == 'BOUNCE_OUT':
+        n1 = 7.5625
+        d1 = 2.75
+        if t < 1 / d1:
+            return n1 * t * t
+        elif t < 2 / d1:
+            t -= 1.5 / d1
+            return n1 * t * t + 0.75
+        elif t < 2.5 / d1:
+            t -= 2.25 / d1
+            return n1 * t * t + 0.9375
+        else:
+            t -= 2.625 / d1
+            return n1 * t * t + 0.984375
+
     return t
 
-# --- Path Resolving ---
 def resolve_path(path):
     try:
         if not path.startswith("bpy."): return None, None, None
@@ -47,14 +85,21 @@ def resolve_path(path):
         return None, None, None
 
 def apply_to_blender(mapping, normalized_value):
-    """ 
-    Takes a 0.0-1.0 value, applies Min/Max scaling, and writes to Blender 
-    """
     obj, prop_name, index = resolve_path(mapping.data_path)
-    if obj is None: return
+    
+    # Determine Output Value
+    if mapping.use_absolute:
+        # Absolute Mode: Scale normalized (0-1) back to MIDI range (0-127)
+        # Note: If this is a velocity note, normalized_value is already velocity/127
+        final_val = normalized_value * 127.0
+    else:
+        # Standard Mode: Scale between User Min/Max
+        final_val = mapping.min_value + (normalized_value * (mapping.max_value - mapping.min_value))
+    
+    # Store the Calculated Value for UI Display
+    mapping.current_output_value = final_val
 
-    # Scale 0-1 to Min-Max
-    final_val = mapping.min_value + (normalized_value * (mapping.max_value - mapping.min_value))
+    if obj is None: return
 
     try:
         if index != -1:
@@ -62,12 +107,9 @@ def apply_to_blender(mapping, normalized_value):
             current_vector[index] = final_val
         else:
             setattr(obj, prop_name, final_val)
-    except Exception:
-        pass
+    except Exception: pass
 
-# --- MIDI Backend ---
 def midi_callback(message):
-    """ Background thread: Just capture the raw signal """
     msg_type = message.type
     if msg_type == 'control_change':
         execution_queue.put(('CC', message.control, message.value))
@@ -77,87 +119,55 @@ def midi_callback(message):
         execution_queue.put(('Note', message.note, 0))
 
 def queue_processor():
-    """ 
-    Main Thread Animation Loop (~60 FPS)
-    Handles both MIDI input processing AND Frame Interpolation.
-    """
     scene = bpy.context.scene
     
-    # 1. Process New MIDI Inputs -> Update Targets
+    # 1. Process Inputs
     while not execution_queue.empty():
         m_type, m_id, m_val = execution_queue.get()
-        
-        # Update Monitor
         try:
             scene.monitor_type = m_type
             scene.monitor_id = m_id
             scene.monitor_val = float(m_val)
         except: pass
 
-        # Update Mappings Targets
-        for i, mapping in enumerate(scene.midi_mappings):
+        for mapping in scene.midi_mappings:
             if mapping.midi_cc == m_id:
-                # Determine Target (0.0 to 1.0)
-                target = 0.0
-                
                 if mapping.use_note:
-                    # For Keys: Note On = 1.0, Note Off = 0.0
-                    # We ignore CC signals if in Key Mode
+                    # Note Mode logic
                     if m_type == 'Note':
-                        target = 1.0 if m_val > 0 else 0.0
-                        mapping.target_value = target
+                        mapping.target_value = 1.0 if m_val > 0 else 0.0
                 else:
-                    # For Knobs: Map 0-127 to 0.0-1.0
-                    # We ignore Note signals if in Knob Mode
+                    # CC Mode logic
                     if m_type != 'Note':
-                        target = m_val / 127.0
-                        mapping.target_value = target
+                        mapping.target_value = m_val / 127.0
 
-    # 2. Animation Step (Interpolate Current -> Target)
-    # This runs every frame for smooth movement
-    
+    # 2. Animation Loop
     for i, mapping in enumerate(scene.midi_mappings):
-        # Initialize state if missing
-        if i not in animation_states:
-            animation_states[i] = mapping.target_value
-            
+        if i not in animation_states: animation_states[i] = mapping.target_value
+        
         current = animation_states[i]
         target = mapping.target_value
         
-        # If we are effectively "there", skip math to save CPU
         if abs(current - target) < 0.001:
-            animation_states[i] = target
             current = target
         else:
-            # Interpolation Logic
             speed = mapping.smooth_speed
+            step = speed * 0.2 if speed < 1.0 else 1.0
             
-            if speed >= 1.0:
-                # Instant (No smoothing)
-                current = target
+            if current < target:
+                current += step
+                if current > target: current = target
             else:
-                # Move towards target
-                # Adjust delta for frame rate (approx 60fps)
-                # Lower speed = Slower transition
-                step = speed * 0.2 
-                
-                if current < target:
-                    current += step
-                    if current > target: current = target
-                else:
-                    current -= step
-                    if current < target: current = target
+                current -= step
+                if current < target: current = target
         
         animation_states[i] = current
         
-        # 3. Apply Curve to the Current Interpolated Value
-        # This allows the "Ease In" to apply to the time transition
+        # Apply Easing Curve
         curved_value = apply_easing(current, mapping.easing_mode)
-        
-        # 4. Write to Blender
         apply_to_blender(mapping, curved_value)
 
-    # Force Redraw (Keep UI responsive)
+    # Redraw
     for win in bpy.context.window_manager.windows:
         for area in win.screen.areas:
             if area.type == 'VIEW_3D' or area.type == 'PROPERTIES':
@@ -174,8 +184,7 @@ def start_listening(port_name):
         if not bpy.app.timers.is_registered(queue_processor):
             bpy.app.timers.register(queue_processor)
         return True
-    except Exception:
-        return False
+    except Exception: return False
 
 def stop_listening():
     global midi_input

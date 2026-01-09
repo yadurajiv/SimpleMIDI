@@ -2,16 +2,16 @@ schema_version = "1.0.0"
 
 # Example of manifest file for a Blender extension
 # Change the values according to your extension
-id = "midicontroller"
-version = "0.1.0"
-name = "BlenderMidi"
+id = "SimpleMIDI"
+version = "0.1.9"
+name = "SimpleMIDI"
 tagline = "Control object parameters through MIDI Input"
-maintainer = "yaDude"
+maintainer = "Yadu Rajiv"
 # Supported types: "add-on", "theme"
 type = "add-on"
 
 # Optional link to documentation, support, source files, etc
-# website = "https://extensions.blender.org/add-ons/my-example-package/"
+website = "https://tinygames.in/blenderMIDI"
 
 # Optional list defined by Blender and server, see:
 # https://docs.blender.org/manual/en/dev/advanced/extensions/tags.html
@@ -52,14 +52,14 @@ platforms = ["windows-x64", "linux-x64", "macos-arm64", "macos-x64"]
 # Keep this a single short sentence without a period (.) at the end.
 # For longer explanations use the documentation or detail page.
 #
-# [permissions]
+[permissions]
+files = "Imports and exports JSON for target maps"
 # network = "Need to sync motion-capture data to server"
-# files = "Import/export FBX from/to disk"
 # clipboard = "Copy and paste bone transforms"
 
 # Optional: build settings.
 # https://docs.blender.org/manual/en/dev/advanced/extensions/command_line_arguments.html#command-line-args-extension-build
-# [build]
+[build]
 paths_exclude_pattern = [
   "__pycache__/",
   "/.git/",

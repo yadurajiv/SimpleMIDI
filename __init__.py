@@ -334,7 +334,7 @@ class OBJECT_PT_MidiController(bpy.types.Panel):
             row.alert = True
 
         box = layout.box()
-        if not is_connected: box.label(text="Status: Disconnected", icon='cancel')
+        if not is_connected: box.label(text="Status: Disconnected", icon='CANCEL')
         elif scene.monitor_id == -1: box.label(text="Monitor: Waiting...", icon='SOUND')
         else: box.label(text=f"Monitor: {scene.monitor_type} #{scene.monitor_id} (Val: {int(scene.monitor_val)})", icon='SOUND')
 

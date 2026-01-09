@@ -311,8 +311,8 @@ class MidiMapping(bpy.types.PropertyGroup):
         default='LINEAR'
     )
 
-class OBJECT_PT_MidiController(bpy.types.Panel):
-    bl_label = "Midi Controller"
+class OBJECT_PT_SimpleMidiController(bpy.types.Panel):
+    bl_label = "SimpleMIDI Controller"
     bl_idname = "OBJECT_PT_midi_controller"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -528,7 +528,7 @@ class MIDI_OT_ImportJSON(bpy.types.Operator, ImportHelper):
                 else: nt.data_path = raw_path
         return {'FINISHED'}
 
-classes = (MidiTarget, MidiMapping, OBJECT_PT_MidiController, MIDI_OT_Connect, MIDI_OT_Disconnect, MIDI_OT_AddMapping, MIDI_OT_DuplicateMapping, MIDI_OT_RemoveMapping, MIDI_OT_AddTarget, MIDI_OT_RemoveTarget, MIDI_OT_ExportJSON, MIDI_OT_ImportJSON)
+classes = (MidiTarget, MidiMapping, OBJECT_PT_SimpleMidiController, MIDI_OT_Connect, MIDI_OT_Disconnect, MIDI_OT_AddMapping, MIDI_OT_DuplicateMapping, MIDI_OT_RemoveMapping, MIDI_OT_AddTarget, MIDI_OT_RemoveTarget, MIDI_OT_ExportJSON, MIDI_OT_ImportJSON)
 
 def register():
     for cls in classes: bpy.utils.register_class(cls)

@@ -11,11 +11,23 @@ from bpy_extras.io_utils import ImportHelper, ExportHelper
 def import_dependencies():
     addon_dir = os.path.dirname(os.path.realpath(__file__))
     wheels_path = os.path.join(addon_dir, "wheels")
-    if wheels_path not in sys.path: sys.path.append(wheels_path)
+    
+    # 1. Temporarily add to path
+    if wheels_path not in sys.path:
+        sys.path.append(wheels_path)
+    
     try:
-        import mido, rtmidi
+        # 2. Import libraries
+        import mido
+        import rtmidi
+        import packaging 
+        try: import rtmidi
+        except ImportError: pass
         return True
     except ImportError: return False
+    finally:
+        # 3. CLEANUP
+        if wheels_path in sys.path: sys.path.remove(wheels_path)
 
 dependencies_loaded = import_dependencies()
 
@@ -26,7 +38,6 @@ animation_states = {}
 midi_input = None
 is_connected = False
 
-# Safe Math Namespace for eval()
 SAFE_MATH = {
     'sin': math.sin, 'cos': math.cos, 'tan': math.tan,
     'pi': math.pi, 'sqrt': math.sqrt, 'pow': math.pow,
@@ -98,43 +109,23 @@ def apply_easing(t, mode):
     return t
 
 def apply_to_blender(target, input_val, use_absolute_midi):
-    """
-    input_val: The 0.0-1.0 interpolated value from the knob/key.
-    """
     obj, prop_name, index = resolve_path(target.data_path)
     if obj is None: return
 
-    # --- MATH & LOGIC ---
-    
-    # 1. Prepare Variables for Math
-    # x = standard 0-1 value
-    # abs_x = raw midi 0-127 value
-    
-    # Update time variables
     SAFE_MATH['frame'] = bpy.context.scene.frame_current
     SAFE_MATH['time'] = bpy.context.scene.frame_current / (bpy.context.scene.render.fps or 24)
     SAFE_MATH['x'] = input_val
     
     final_val = 0.0
 
-    # 2. Check for Custom Expression
     if target.expression.strip() != "":
-        try:
-            # Evaluate string: e.g. "sin(time * x * 5)"
-            final_val = float(eval(target.expression, {"__builtins__": None}, SAFE_MATH))
-        except:
-            # Fallback if math fails
-            final_val = input_val
+        try: final_val = float(eval(target.expression, {"__builtins__": None}, SAFE_MATH))
+        except: final_val = input_val
     else:
-        # 3. Standard Logic (Min/Max)
-        if use_absolute_midi:
-            final_val = input_val * 127.0
-        else:
-            final_val = target.min_value + (input_val * (target.max_value - target.min_value))
+        if use_absolute_midi: final_val = input_val * 127.0
+        else: final_val = target.min_value + (input_val * (target.max_value - target.min_value))
 
-    # 4. Handle Motor Mode (Accumulate) vs Standard (Set)
     try:
-        # Get current value to add to it, or overwrite it
         if index != -1:
             current_vector = getattr(obj, prop_name)
             current_val = current_vector[index]
@@ -142,33 +133,17 @@ def apply_to_blender(target, input_val, use_absolute_midi):
             current_val = getattr(obj, prop_name)
 
         if target.drive_mode == 'ACCUMULATE':
-            # Motor Mode: Value += Input * Scale
-            # We treat 'final_val' as the Speed/Delta
-            # If no expression, we center it: 0.5 is stop, 1.0 is fwd, 0.0 is back
-            
             delta = 0.0
-            if target.expression.strip() != "":
-                delta = final_val # Use expression result directly as speed
-            else:
-                # Default Motor Logic: 
-                # Knob middle (0.5) = Stop.
-                # Knob right (>0.5) = Forward.
-                # Knob left (<0.5) = Backward.
-                delta = (final_val - (target.max_value + target.min_value)/2) * 0.1 # Arbitrary speed factor
-            
+            if target.expression.strip() != "": delta = final_val
+            else: delta = (final_val - (target.max_value + target.min_value)/2) * 0.1
             new_val = current_val + delta
-            
         else:
-            # Standard Mode: Direct Set
             new_val = final_val
 
-        # 5. Apply & Keyframe
         target.current_val_display = new_val
 
-        if index != -1:
-            current_vector[index] = new_val
-        else:
-            setattr(obj, prop_name, new_val)
+        if index != -1: current_vector[index] = new_val
+        else: setattr(obj, prop_name, new_val)
             
         if bpy.context.scene.tool_settings.use_keyframe_insert_auto:
             obj.keyframe_insert(data_path=prop_name, index=index if index != -1 else -1)
@@ -185,7 +160,6 @@ def midi_callback(message):
 
 def queue_processor():
     scene = bpy.context.scene
-    
     while not execution_queue.empty():
         m_type, m_id, m_val = execution_queue.get()
         try:
@@ -203,7 +177,6 @@ def queue_processor():
 
     for i, mapping in enumerate(scene.midi_mappings):
         if i not in animation_states: animation_states[i] = mapping.target_value
-        
         prev_val = animation_states[i]
         target = mapping.target_value
         current = prev_val
@@ -219,8 +192,6 @@ def queue_processor():
                 current -= step
                 if current < target: current = target
         
-        # Optimize: Only update if changed OR if using Motor/Math mode (which might depend on time)
-        # We need to check if any target uses Time/Frame variables or Accumulate mode
         is_active_mode = any(t.drive_mode == 'ACCUMULATE' or 'time' in t.expression or 'frame' in t.expression for t in mapping.targets)
         
         if abs(current - prev_val) > 0.00001 or (is_active_mode and current > 0.01):
@@ -285,8 +256,6 @@ class MidiTarget(bpy.types.PropertyGroup):
     min_value: bpy.props.FloatProperty(name="Min", default=0.0)
     max_value: bpy.props.FloatProperty(name="Max", default=1.0)
     current_val_display: bpy.props.FloatProperty(default=0.0, options={'SKIP_SAVE'})
-    
-    # NEW FEATURES
     drive_mode: bpy.props.EnumProperty(
         name="Mode",
         items=[('SET', "Set (Standard)", ""), ('ACCUMULATE', "Motor (Accumulate)", "")],
@@ -311,8 +280,8 @@ class MidiMapping(bpy.types.PropertyGroup):
         default='LINEAR'
     )
 
-class OBJECT_PT_SimpleMidiController(bpy.types.Panel):
-    bl_label = "SimpleMIDI Controller"
+class OBJECT_PT_MidiController(bpy.types.Panel):
+    bl_label = "Midi Controller"
     bl_idname = "OBJECT_PT_midi_controller"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -334,7 +303,7 @@ class OBJECT_PT_SimpleMidiController(bpy.types.Panel):
             row.alert = True
 
         box = layout.box()
-        if not is_connected: box.label(text="Status: Disconnected", icon='CANCEL')
+        if not is_connected: box.label(text="Status: Disconnected", icon='CANCEL') 
         elif scene.monitor_id == -1: box.label(text="Monitor: Waiting...", icon='SOUND')
         else: box.label(text=f"Monitor: {scene.monitor_type} #{scene.monitor_id} (Val: {int(scene.monitor_val)})", icon='SOUND')
 
@@ -368,35 +337,32 @@ class OBJECT_PT_SimpleMidiController(bpy.types.Panel):
                     t_box = t_col.box()
                     t_row = t_box.row()
                     t_row.prop(target, "data_path", text="")
+                    
+                    # --- NEW SMART PASTE BUTTON ---
+                    paste_op = t_row.operator("wm.midi_paste_target", text="", icon='PASTEDOWN')
+                    paste_op.mapping_index = index
+                    paste_op.target_index = t_index
+                    
                     t_row.operator("wm.midi_remove_target", text="", icon='REMOVE').mapping_index = index
                     
-                    # Logic Row
                     t_row = t_box.row(align=True)
-                    t_row.prop(target, "drive_mode", text="") # Set vs Motor
+                    t_row.prop(target, "drive_mode", text="")
                     
-                    if target.expression:
-                         t_row.prop(target, "expression", text="Expr", icon='SCRIPT')
+                    if target.expression: t_row.prop(target, "expression", text="Expr", icon='SCRIPT')
                     else:
                         if not mapping.use_absolute:
                             t_row.prop(target, "min_value", text="Min")
                             t_row.prop(target, "max_value", text="Max")
-                        else:
-                            t_row.label(text="(Abs Mode)")
+                        else: t_row.label(text="(Abs Mode)")
                     
-                    # Expression Field (Full width if typed in)
-                    if target.expression:
-                         t_box.prop(target, "expression", text="Math")
-                    else:
-                         # Tiny button to reveal math
-                         t_box.prop(target, "expression", text="Add Math...")
+                    if target.expression: t_box.prop(target, "expression", text="Math")
+                    else: t_box.prop(target, "expression", text="Add Math...")
 
                 col.operator("wm.midi_add_target", text="Add Target", icon='ADD').mapping_index = index
 
         layout.operator("wm.midi_add_mapping", text="New Mapping", icon='ADD')
 
-# --- OPERATORS (Unchanged except JSON Update) ---
-# ... (Standard Connect/Disconnect/Add/Remove/Duplicate ops same as before) ...
-# Need to update Export/Import for new properties 'drive_mode' and 'expression'
+# --- OPERATORS ---
 
 class MIDI_OT_Connect(bpy.types.Operator):
     bl_idname = "wm.midi_connect"
@@ -473,6 +439,32 @@ class MIDI_OT_RemoveTarget(bpy.types.Operator):
         if len(targets) > 0: targets.remove(len(targets)-1) 
         return {'FINISHED'}
 
+# --- NEW PASTE OPERATOR ---
+class MIDI_OT_PasteTarget(bpy.types.Operator):
+    bl_idname = "wm.midi_paste_target"
+    bl_label = "Paste Path"
+    bl_description = "Paste Data Path from Clipboard. If relative, attaches to Active Object."
+    
+    mapping_index: bpy.props.IntProperty()
+    target_index: bpy.props.IntProperty()
+    
+    def execute(self, context):
+        path = context.window_manager.clipboard.strip()
+        target = context.scene.midi_mappings[self.mapping_index].targets[self.target_index]
+        
+        if path.startswith("bpy."):
+            target.data_path = path
+        else:
+            obj = context.active_object
+            if obj:
+                # Auto-prefix active object
+                target.data_path = f'bpy.data.objects["{obj.name}"].{path}'
+                self.report({'INFO'}, f"Auto-filled for {obj.name}")
+            else:
+                self.report({'WARNING'}, "Clipboard path is relative, but no Active Object found.")
+        
+        return {'FINISHED'}
+
 class MIDI_OT_ExportJSON(bpy.types.Operator, ExportHelper):
     bl_idname = "wm.midi_export_json"
     bl_label = "Export"
@@ -528,7 +520,7 @@ class MIDI_OT_ImportJSON(bpy.types.Operator, ImportHelper):
                 else: nt.data_path = raw_path
         return {'FINISHED'}
 
-classes = (MidiTarget, MidiMapping, OBJECT_PT_SimpleMidiController, MIDI_OT_Connect, MIDI_OT_Disconnect, MIDI_OT_AddMapping, MIDI_OT_DuplicateMapping, MIDI_OT_RemoveMapping, MIDI_OT_AddTarget, MIDI_OT_RemoveTarget, MIDI_OT_ExportJSON, MIDI_OT_ImportJSON)
+classes = (MidiTarget, MidiMapping, OBJECT_PT_MidiController, MIDI_OT_Connect, MIDI_OT_Disconnect, MIDI_OT_AddMapping, MIDI_OT_DuplicateMapping, MIDI_OT_RemoveMapping, MIDI_OT_AddTarget, MIDI_OT_RemoveTarget, MIDI_OT_PasteTarget, MIDI_OT_ExportJSON, MIDI_OT_ImportJSON)
 
 def register():
     for cls in classes: bpy.utils.register_class(cls)

@@ -7,8 +7,16 @@ import json
 from bpy.app.handlers import persistent
 from bpy_extras.io_utils import ImportHelper, ExportHelper
 
-# --- 1. DEPENDENCY LOADER ---
+# ==============================================================================
+# SECTION 1: DEPENDENCY MANAGEMENT
+# ==============================================================================
+
 def import_dependencies():
+    """
+    Temporarily adds the 'wheels' directory to sys.path to import
+    bundled 3rd party libraries (mido, rtmidi), then removes it
+    to comply with Blender Extension policies.
+    """
     addon_dir = os.path.dirname(os.path.realpath(__file__))
     wheels_path = os.path.join(addon_dir, "wheels")
     
@@ -17,27 +25,31 @@ def import_dependencies():
         sys.path.append(wheels_path)
     
     try:
-        # 2. Import libraries
+        # 2. Import libraries into memory
         import mido
         import rtmidi
         import packaging 
+        # Force load backend now to prevent lazy-loading errors later
         try: import rtmidi
         except ImportError: pass
         return True
     except ImportError: return False
     finally:
-        # 3. CLEANUP
+        # 3. CLEANUP: Remove from path immediately
         if wheels_path in sys.path: sys.path.remove(wheels_path)
 
 dependencies_loaded = import_dependencies()
 
-# --- 2. CORE LOGIC ---
+# ==============================================================================
+# SECTION 2: CORE LOGIC & STATE
+# ==============================================================================
 
 execution_queue = queue.SimpleQueue()
-animation_states = {}
+animation_states = {} # Stores current smoothed values
 midi_input = None
 is_connected = False
 
+# Safe Namespace for user-defined math expressions
 SAFE_MATH = {
     'sin': math.sin, 'cos': math.cos, 'tan': math.tan,
     'pi': math.pi, 'sqrt': math.sqrt, 'pow': math.pow,
@@ -46,6 +58,9 @@ SAFE_MATH = {
 }
 
 def robust_path_split(path):
+    """
+    Splits a data path by dots (.), ignoring dots inside quotes ["..."].
+    """
     parts = []
     current = ""
     in_quote = False
@@ -66,26 +81,62 @@ def robust_path_split(path):
     return parts
 
 def resolve_path(path):
+    """
+    Walks down the Blender data path to find the object and property.
+    Handles standard paths: bpy.data.objects["Cube"].location
+    Handles list/dict paths: nodes["Group"].inputs[5]
+    
+    Returns: (parent_object, property_name, index)
+    """
     try:
-        if not path.startswith("bpy."): return None, None, None
+        if not path.startswith("bpy."): return None, None, -1
+        
         parts = robust_path_split(path)
+        # parts[0] is 'bpy', start from 1
         obj = bpy
-        for part in parts[1:-1]:
-            if '[' in part and ']' in part:
+        
+        # Navigate to the parent object (2nd to last item)
+        parent_parts = parts[1:-1]
+        target_prop = parts[-1] 
+        
+        for part in parent_parts:
+            if '[' in part and part.endswith(']'):
+                # Handle complex access like: collection["Name"]
                 base_name, key_section = part.split('[', 1)
-                key = key_section.rstrip(']').strip("'\"")
-                if key.isdigit(): key = int(key)
-                obj = getattr(obj, base_name)[key]
-            else: obj = getattr(obj, part)
-        last_part = parts[-1]; index = -1
-        if '[' in last_part and ']' in last_part:
-            prop_name, idx_section = last_part.split('[', 1)
-            index = int(idx_section.rstrip(']'))
-        else: prop_name = last_part
+                key_raw = key_section.rstrip(']')
+                
+                obj = getattr(obj, base_name)
+                
+                if (key_raw.startswith('"') and key_raw.endswith('"')) or \
+                   (key_raw.startswith("'") and key_raw.endswith("'")):
+                    key = key_raw[1:-1] # String key
+                elif key_raw.isdigit():
+                    key = int(key_raw)  # Int key
+                else:
+                    key = key_raw       # Fallback
+                
+                obj = obj[key]
+            else:
+                obj = getattr(obj, part)
+        
+        # Parse the final property to see if it has an index (e.g., location[0])
+        index = -1
+        prop_name = target_prop
+        
+        if '[' in target_prop and target_prop.endswith(']'):
+            base_name, idx_str = target_prop.split('[', 1)
+            prop_name = base_name
+            idx_clean = idx_str.rstrip(']')
+            if idx_clean.isdigit():
+                index = int(idx_clean)
+        
         return obj, prop_name, index
-    except: return None, None, None
+        
+    except Exception:
+        return None, None, None
 
 def apply_easing(t, mode):
+    """Applies physics curves to the 0-1 interpolation value."""
     if t < 0: t = 0
     if t > 1: t = 1
     if mode == 'LINEAR': return t
@@ -94,7 +145,9 @@ def apply_easing(t, mode):
     elif mode == 'QUAD_INOUT': return 2 * t * t if t < 0.5 else 1 - math.pow(-2 * t + 2, 2) / 2
     elif mode == 'CUBIC_OUT': return 1 - math.pow(1 - t, 3)
     elif mode == 'EXPO_OUT': return 1 if t == 1 else 1 - math.pow(2, -10 * t)
-    elif mode == 'BACK_OUT': c1 = 1.70158; c3 = c1 + 1; return 1 + c3 * math.pow(t - 1, 3) + c1 * math.pow(t - 1, 2)
+    elif mode == 'BACK_OUT': 
+        c1 = 1.70158; c3 = c1 + 1
+        return 1 + c3 * math.pow(t - 1, 3) + c1 * math.pow(t - 1, 2)
     elif mode == 'ELASTIC_OUT':
         if t == 0: return 0
         if t == 1: return 1
@@ -109,15 +162,17 @@ def apply_easing(t, mode):
     return t
 
 def apply_to_blender(target, input_val, use_absolute_midi):
+    """Writes the calculated value to the specific Blender property."""
     obj, prop_name, index = resolve_path(target.data_path)
     if obj is None: return
 
+    # Update math context
     SAFE_MATH['frame'] = bpy.context.scene.frame_current
     SAFE_MATH['time'] = bpy.context.scene.frame_current / (bpy.context.scene.render.fps or 24)
     SAFE_MATH['x'] = input_val
     
+    # 1. Calculate Target Value
     final_val = 0.0
-
     if target.expression.strip() != "":
         try: final_val = float(eval(target.expression, {"__builtins__": None}, SAFE_MATH))
         except: final_val = input_val
@@ -126,31 +181,41 @@ def apply_to_blender(target, input_val, use_absolute_midi):
         else: final_val = target.min_value + (input_val * (target.max_value - target.min_value))
 
     try:
+        # 2. Get Current Value (Required for Accumulate Mode)
         if index != -1:
-            current_vector = getattr(obj, prop_name)
-            current_val = current_vector[index]
+            container = getattr(obj, prop_name)
+            current_val = container[index]
         else:
             current_val = getattr(obj, prop_name)
 
+        # 3. Apply Drive Mode Logic
         if target.drive_mode == 'ACCUMULATE':
-            delta = 0.0
-            if target.expression.strip() != "": delta = final_val
-            else: delta = (final_val - (target.max_value + target.min_value)/2) * 0.1
-            new_val = current_val + delta
+            # Motor Logic: Value += InputSpeed
+            new_val = current_val + final_val
         else:
+            # Set Logic: Value = Input
             new_val = final_val
 
         target.current_val_display = new_val
 
-        if index != -1: current_vector[index] = new_val
-        else: setattr(obj, prop_name, new_val)
-            
-        if bpy.context.scene.tool_settings.use_keyframe_insert_auto:
-            obj.keyframe_insert(data_path=prop_name, index=index if index != -1 else -1)
+        # 4. Write & Keyframe
+        if index != -1:
+            container[index] = new_val
+            if bpy.context.scene.tool_settings.use_keyframe_insert_auto:
+                obj.keyframe_insert(data_path=prop_name, index=index)
+        else:
+            setattr(obj, prop_name, new_val)
+            if bpy.context.scene.tool_settings.use_keyframe_insert_auto:
+                obj.keyframe_insert(data_path=prop_name)
 
     except Exception: pass
 
+# ==============================================================================
+# SECTION 3: MIDI PROCESSING & LOOP
+# ==============================================================================
+
 def midi_callback(message):
+    """Runs in a separate thread. Puts raw MIDI messages into a thread-safe queue."""
     if message.type == 'control_change':
         execution_queue.put(('CC', message.control, message.value))
     elif message.type == 'note_on':
@@ -159,7 +224,10 @@ def midi_callback(message):
         execution_queue.put(('Note', message.note, 0))
 
 def queue_processor():
+    """Runs on the Main Blender Thread. Reads queue and updates scene."""
     scene = bpy.context.scene
+    
+    # 1. Update Monitor & Mappings
     while not execution_queue.empty():
         m_type, m_id, m_val = execution_queue.get()
         try:
@@ -175,12 +243,14 @@ def queue_processor():
                 else:
                     if m_type != 'Note': mapping.target_value = m_val / 127.0
 
+    # 2. Smooth Values & Apply to Blender
     for i, mapping in enumerate(scene.midi_mappings):
         if i not in animation_states: animation_states[i] = mapping.target_value
-        prev_val = animation_states[i]
-        target = mapping.target_value
-        current = prev_val
         
+        current = animation_states[i]
+        target = mapping.target_value
+        
+        # Smooth interpolation
         if abs(current - target) < 0.001: current = target
         else:
             speed = mapping.smooth_speed
@@ -192,18 +262,21 @@ def queue_processor():
                 current -= step
                 if current < target: current = target
         
-        is_active_mode = any(t.drive_mode == 'ACCUMULATE' or 'time' in t.expression or 'frame' in t.expression for t in mapping.targets)
+        # Optimize: Only apply if value changed or if we are in a continuous mode (Time/Motor)
+        is_continuous = any(t.drive_mode == 'ACCUMULATE' or 'time' in t.expression or 'frame' in t.expression for t in mapping.targets)
         
-        if abs(current - prev_val) > 0.00001 or (is_active_mode and current > 0.01):
+        if abs(current - animation_states[i]) > 0.00001 or (is_continuous and abs(current) > 0.001):
             animation_states[i] = current
             curved_val = apply_easing(current, mapping.easing_mode)
-            for target in mapping.targets:
-                apply_to_blender(target, curved_val, mapping.use_absolute)
+            for t in mapping.targets:
+                apply_to_blender(t, curved_val, mapping.use_absolute)
         
+    # Force Redraw
     for window in bpy.context.window_manager.windows:
         for area in window.screen.areas:
             if area.type == 'VIEW_3D': area.tag_redraw()
-    return 0.016 
+            
+    return 0.016 # Run approx 60fps
 
 def start_listening(port_name):
     import mido
@@ -223,10 +296,13 @@ def stop_listening():
     is_connected = False
     if bpy.app.timers.is_registered(queue_processor): bpy.app.timers.unregister(queue_processor)
 
-# --- 3. UI & PROPS ---
+# ==============================================================================
+# SECTION 4: UI & PROPS
+# ==============================================================================
 
 @persistent
 def auto_select_device(dummy):
+    """Auto-connects to the first available MIDI device on load."""
     if not dependencies_loaded: return
     try:
         import mido
@@ -252,7 +328,7 @@ def update_device_selection(self, context):
         self.midi_device_name = self.midi_device_enum
 
 class MidiTarget(bpy.types.PropertyGroup):
-    data_path: bpy.props.StringProperty(name="Path")
+    data_path: bpy.props.StringProperty(name="Path", description="Right-click property > Copy Full Data Path")
     min_value: bpy.props.FloatProperty(name="Min", default=0.0)
     max_value: bpy.props.FloatProperty(name="Max", default=1.0)
     current_val_display: bpy.props.FloatProperty(default=0.0, options={'SKIP_SAVE'})
@@ -261,7 +337,7 @@ class MidiTarget(bpy.types.PropertyGroup):
         items=[('SET', "Set (Standard)", ""), ('ACCUMULATE', "Motor (Accumulate)", "")],
         default='SET'
     )
-    expression: bpy.props.StringProperty(name="Math", description="e.g: sin(time * x * 10). Vars: x (input 0-1), time, frame")
+    expression: bpy.props.StringProperty(name="Math", description="e.g: sin(time * x). Vars: x, time, frame")
 
 class MidiMapping(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(name="Name", default="Mapping")
@@ -338,7 +414,7 @@ class OBJECT_PT_MidiController(bpy.types.Panel):
                     t_row = t_box.row()
                     t_row.prop(target, "data_path", text="")
                     
-                    # --- NEW SMART PASTE BUTTON ---
+                    # Smart Paste Button
                     paste_op = t_row.operator("wm.midi_paste_target", text="", icon='PASTEDOWN')
                     paste_op.mapping_index = index
                     paste_op.target_index = t_index
@@ -362,7 +438,9 @@ class OBJECT_PT_MidiController(bpy.types.Panel):
 
         layout.operator("wm.midi_add_mapping", text="New Mapping", icon='ADD')
 
-# --- OPERATORS ---
+# ==============================================================================
+# SECTION 5: OPERATORS & REGISTRATION
+# ==============================================================================
 
 class MIDI_OT_Connect(bpy.types.Operator):
     bl_idname = "wm.midi_connect"
@@ -439,30 +517,20 @@ class MIDI_OT_RemoveTarget(bpy.types.Operator):
         if len(targets) > 0: targets.remove(len(targets)-1) 
         return {'FINISHED'}
 
-# --- NEW PASTE OPERATOR ---
 class MIDI_OT_PasteTarget(bpy.types.Operator):
     bl_idname = "wm.midi_paste_target"
     bl_label = "Paste Path"
     bl_description = "Paste Data Path from Clipboard. If relative, attaches to Active Object."
-    
     mapping_index: bpy.props.IntProperty()
     target_index: bpy.props.IntProperty()
-    
     def execute(self, context):
         path = context.window_manager.clipboard.strip()
         target = context.scene.midi_mappings[self.mapping_index].targets[self.target_index]
-        
-        if path.startswith("bpy."):
-            target.data_path = path
+        if path.startswith("bpy."): target.data_path = path
         else:
             obj = context.active_object
-            if obj:
-                # Auto-prefix active object
-                target.data_path = f'bpy.data.objects["{obj.name}"].{path}'
-                self.report({'INFO'}, f"Auto-filled for {obj.name}")
-            else:
-                self.report({'WARNING'}, "Clipboard path is relative, but no Active Object found.")
-        
+            if obj: target.data_path = f'bpy.data.objects["{obj.name}"].{path}'
+            else: self.report({'WARNING'}, "Clipboard path is relative, but no Active Object found.")
         return {'FINISHED'}
 
 class MIDI_OT_ExportJSON(bpy.types.Operator, ExportHelper):

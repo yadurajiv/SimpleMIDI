@@ -7,41 +7,11 @@ import json
 from bpy.app.handlers import persistent
 from bpy_extras.io_utils import ImportHelper, ExportHelper
 
-# ==============================================================================
-# SECTION 1: DEPENDENCY MANAGEMENT
-# ==============================================================================
-
-def import_dependencies():
-    """
-    Temporarily adds the 'wheels' directory to sys.path to import
-    bundled 3rd party libraries (mido, rtmidi), then removes it
-    to comply with Blender Extension policies.
-    """
-    addon_dir = os.path.dirname(os.path.realpath(__file__))
-    wheels_path = os.path.join(addon_dir, "wheels")
-    
-    # 1. Temporarily add to path
-    if wheels_path not in sys.path:
-        sys.path.append(wheels_path)
-    
-    try:
-        # 2. Import libraries into memory
-        import mido
-        import rtmidi
-        import packaging 
-        # Force load backend now to prevent lazy-loading errors later
-        try: import rtmidi
-        except ImportError: pass
-        return True
-    except ImportError: return False
-    finally:
-        # 3. CLEANUP: Remove from path immediately
-        if wheels_path in sys.path: sys.path.remove(wheels_path)
-
-dependencies_loaded = import_dependencies()
+import mido
+import rtmidi
 
 # ==============================================================================
-# SECTION 2: CORE LOGIC & STATE
+# SECTION 1: CORE LOGIC & STATE
 # ==============================================================================
 
 execution_queue = queue.SimpleQueue()
@@ -211,7 +181,7 @@ def apply_to_blender(target, input_val, use_absolute_midi):
     except Exception: pass
 
 # ==============================================================================
-# SECTION 3: MIDI PROCESSING & LOOP
+# SECTION 2: MIDI PROCESSING & LOOP
 # ==============================================================================
 
 def midi_callback(message):
@@ -297,30 +267,22 @@ def stop_listening():
     if bpy.app.timers.is_registered(queue_processor): bpy.app.timers.unregister(queue_processor)
 
 # ==============================================================================
-# SECTION 4: UI & PROPS
+# SECTION 3: UI & PROPS
 # ==============================================================================
 
 @persistent
 def auto_select_device(dummy):
     """Auto-connects to the first available MIDI device on load."""
-    if not dependencies_loaded: return
-    try:
-        import mido
-        devices = mido.get_input_names()
-        if devices and bpy.context.scene.midi_device_name == "":
-            bpy.context.scene.midi_device_name = devices[0]
-            bpy.context.scene.midi_device_enum = devices[0]
-    except: pass
+    devices = mido.get_input_names()
+    if devices and bpy.context.scene.midi_device_name == "":
+        bpy.context.scene.midi_device_name = devices[0]
+        bpy.context.scene.midi_device_enum = devices[0]
 
 def get_midi_devices(self, context):
     items = []
-    if not dependencies_loaded: return [('NONE', "Missing Dependencies", "")]
-    try:
-        import mido
-        devices = mido.get_input_names()
-        for dev in devices: items.append((dev, dev, "MIDI Device"))
-        if not items: items.append(('NONE', "No Devices Found", ""))
-    except Exception as e: items.append(('ERROR', str(e), ""))
+    devices = mido.get_input_names()
+    for dev in devices: items.append((dev, dev, "MIDI Device"))
+    if not items: items.append(('NONE', "No Devices Found", ""))
     return items
 
 def update_device_selection(self, context):
@@ -439,7 +401,7 @@ class OBJECT_PT_MidiController(bpy.types.Panel):
         layout.operator("wm.midi_add_mapping", text="New Mapping", icon='ADD')
 
 # ==============================================================================
-# SECTION 5: OPERATORS & REGISTRATION
+# SECTION 4: OPERATORS & REGISTRATION
 # ==============================================================================
 
 class MIDI_OT_Connect(bpy.types.Operator):

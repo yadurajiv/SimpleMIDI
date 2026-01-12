@@ -182,11 +182,10 @@ def apply_easing(t, mode):
     return t
 
 def apply_to_blender(target, input_val, use_absolute_midi):
-    """Writes the calculated value to the specific Blender property."""
     obj, prop_name, index = resolve_path(target.data_path)
     if obj is None: return
 
-    # Prepare Context for Safe Math
+    # Prepare Context
     math_ctx = SAFE_FUNCTIONS.copy()
     math_ctx['frame'] = bpy.context.scene.frame_current
     math_ctx['time'] = bpy.context.scene.frame_current / (bpy.context.scene.render.fps or 24)
@@ -197,12 +196,11 @@ def apply_to_blender(target, input_val, use_absolute_midi):
     if target.expression.strip() != "":
         final_val = safe_evaluate_expression(target.expression, math_ctx)
     else:
-        # Standard Min/Max Mapping
         if use_absolute_midi: final_val = input_val * 127.0
         else: final_val = target.min_value + (input_val * (target.max_value - target.min_value))
 
     try:
-        # 2. Get Current Value (Required for Accumulate Mode)
+        # 2. Get Current Value & Type
         if index != -1:
             container = getattr(obj, prop_name)
             current_val = container[index]
@@ -211,14 +209,24 @@ def apply_to_blender(target, input_val, use_absolute_midi):
 
         # 3. Apply Drive Mode Logic
         if target.drive_mode == 'ACCUMULATE':
-            # Motor Logic: Value += InputSpeed
-            # If Min/Max are -0.1 to 0.1, key release (0) = -0.1 speed (reverse).
             new_val = current_val + final_val
         else:
-            # Set Logic: Value = Input
             new_val = final_val
 
-        target.current_val_display = new_val
+        # --- BETTER TYPE HANDLING ---
+        # Detect the type of the property we are controlling and adapt.
+        
+        if isinstance(current_val, bool):
+            # BOOLEAN: Threshold at 0.5 (Snap On/Off)
+            new_val = (new_val >= 0.5)
+            
+        elif isinstance(current_val, int):
+            # INTEGER: Round to nearest whole number
+            new_val = int(round(new_val))
+            
+        # FLOATS are passed through directly (no change needed)
+
+        target.current_val_display = float(new_val)
 
         # 4. Write & Keyframe
         if index != -1:

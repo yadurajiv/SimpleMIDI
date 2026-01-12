@@ -43,7 +43,38 @@ Treats the input as a "Gas Pedal" or Velocity.
 * *Best for: Endless rotation, Driving a car forward, Scrolling timeline.*
 
 ## Math Expressions
-You can transform the input using Python math.
-* `x` = Input value (0.0 to 1.0)
-* `time` = Current scene time (seconds)
-* `sin(time * x)` = Oscillate speed based on knob input.
+
+You can transform the input signal using math expressions. This is useful for inverting knobs, changing ranges, or creating procedural motion driven by time.
+
+### Available Variables
+* `x` : The raw MIDI input value (0.0 to 1.0).
+* `time` : Current scene time in seconds.
+* `frame` : Current scene frame number.
+
+### Supported Functions
+Only the following math functions are allowed:
+* **Basic:** `+`, `-`, `*`, `/`, `**` (Power)
+* **Trig:** `sin`, `cos`, `tan`, `pi`
+* **Utilities:** `min`, `max`, `abs`, `round`, `sqrt`, `pow`
+
+### Examples
+
+#### 🎛️ Knobs & Sliders (Continuous `0.0` to `1.0`)
+| Effect | Expression | Description |
+| :--- | :--- | :--- |
+| **Increase Range** | `x * 10` | Outputs 0 to 10 (Good for Arrays/Counts). |
+| **Invert** | `1.0 - x` | Turning knob right decreases value. |
+| **Exponential** | `pow(x, 3)` | Fine control at low values, fast at high values. |
+| **Stepped (Snap)** | `round(x * 4) / 4` | Snaps value to 0, 0.25, 0.5, 0.75, 1.0. |
+| **Auto-Wiggle** | `sin(time * 5) * x` | Object moves automatically; Knob controls intensity. |
+| **Speed Control** | `sin(time * x * 10)` | Object moves -1 to 1; Knob controls frequency. |
+
+#### 🎹 Buttons & Keys (Binary `0.0` or `1.0`)
+| Effect | Expression | Description |
+| :--- | :--- | :--- |
+| **Momentary Switch** | `x` | **Pressed** = On (1), **Released** = Off (0). Great for checkboxes. |
+| **Hold to Hide** | `1.0 - x` | **Pressed** = Off (0), **Released** = On (1). Good for "Mute". |
+| **Jump to Value** | `x * 45` | **Pressed** = 45, **Released** = 0. Good for rotation snaps. |
+| **Value A / Value B** | `5 + (x * 10)` | **Released** = 5, **Pressed** = 15. Toggles between two specific numbers. |
+| **Motor Drive** | `x * 0.1` | *(Use Accumulate Mode)* **Hold** to rotate/move object, **Release** to stop. |
+| **Camera Cut** | `x * 2` | **Pressed** = Camera Index 2, **Released** = Camera Index 0. |

@@ -1,31 +1,81 @@
+
 import bpy
 import sys
 import os
-import queue
 import math
 import json
+import ast
+import operator
 from bpy.app.handlers import persistent
 from bpy_extras.io_utils import ImportHelper, ExportHelper
 
+# DEPENDENCIES
 import mido
 import rtmidi
 
 # ==============================================================================
-# SECTION 1: CORE LOGIC & STATE
+# SECTION 1: SAFE MATH EVALUATOR
 # ==============================================================================
-
-execution_queue = queue.SimpleQueue()
-animation_states = {} # Stores current smoothed values
-midi_input = None
-is_connected = False
-
-# Safe Namespace for user-defined math expressions
-SAFE_MATH = {
+# Whitelist of allowed math functions
+SAFE_FUNCTIONS = {
     'sin': math.sin, 'cos': math.cos, 'tan': math.tan,
     'pi': math.pi, 'sqrt': math.sqrt, 'pow': math.pow,
     'abs': abs, 'round': round, 'min': min, 'max': max,
-    'time': 0.0, 'frame': 0.0
 }
+
+# Whitelist of allowed operators (+, -, *, /)
+SAFE_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+def _eval_node(node, context):
+    """Recursively evaluates an AST node with strict safety checks."""
+    if isinstance(node, ast.Constant):  # Numbers (Python 3.8+)
+        return node.value
+    elif isinstance(node, ast.Num):     # Numbers (Legacy)
+        return node.n
+    elif isinstance(node, ast.Name):    # Variables (x, time, frame)
+        return context.get(node.id, 0.0)
+    elif isinstance(node, ast.BinOp):   # Math operations (left + right)
+        op_func = SAFE_OPERATORS.get(type(node.op))
+        if op_func:
+            return op_func(_eval_node(node.left, context), _eval_node(node.right, context))
+    elif isinstance(node, ast.UnaryOp): # Unary operations (-1)
+        op_func = SAFE_OPERATORS.get(type(node.op))
+        if op_func:
+            return op_func(_eval_node(node.operand, context))
+    elif isinstance(node, ast.Call):    # Functions (sin, cos)
+        func_name = node.func.id
+        if func_name in SAFE_FUNCTIONS:
+            args = [_eval_node(arg, context) for arg in node.args]
+            return SAFE_FUNCTIONS[func_name](*args)
+    return 0.0
+
+def safe_evaluate_expression(expression, context):
+    """Parses and evaluates a math string without using eval()."""
+    try:
+        if not expression or not expression.strip():
+            return 0.0
+        # Parse expression into an Abstract Syntax Tree (AST)
+        tree = ast.parse(expression, mode='eval')
+        # Walk the tree and calculate
+        return float(_eval_node(tree.body, context))
+    except Exception:
+        return 0.0
+
+# ==============================================================================
+# SECTION 2: CORE LOGIC & STATE
+# ==============================================================================
+
+animation_states = {} # Stores current smoothed values for interpolation
+midi_input = None     # The active MIDI port object
+is_connected = False  # Connection flag
 
 def robust_path_split(path):
     """
@@ -44,25 +94,24 @@ def robust_path_split(path):
             if not in_quote: in_bracket = True
         elif char == ']':
             if not in_quote: in_bracket = False 
+        
+        # Split ONLY if it's a dot and we are NOT inside quotes or brackets
         if char == '.' and not in_quote and not in_bracket:
             parts.append(current); current = ""
         else: current += char
+        
     if current: parts.append(current)
     return parts
 
 def resolve_path(path):
     """
     Walks down the Blender data path to find the object and property.
-    Handles standard paths: bpy.data.objects["Cube"].location
-    Handles list/dict paths: nodes["Group"].inputs[5]
-    
     Returns: (parent_object, property_name, index)
     """
     try:
         if not path.startswith("bpy."): return None, None, -1
         
         parts = robust_path_split(path)
-        # parts[0] is 'bpy', start from 1
         obj = bpy
         
         # Navigate to the parent object (2nd to last item)
@@ -70,13 +119,14 @@ def resolve_path(path):
         target_prop = parts[-1] 
         
         for part in parent_parts:
+            # Handle dictionary/array access like: nodes["Group"]
             if '[' in part and part.endswith(']'):
-                # Handle complex access like: collection["Name"]
                 base_name, key_section = part.split('[', 1)
                 key_raw = key_section.rstrip(']')
                 
                 obj = getattr(obj, base_name)
                 
+                # Parse Key (String or Int)
                 if (key_raw.startswith('"') and key_raw.endswith('"')) or \
                    (key_raw.startswith("'") and key_raw.endswith("'")):
                     key = key_raw[1:-1] # String key
@@ -136,17 +186,18 @@ def apply_to_blender(target, input_val, use_absolute_midi):
     obj, prop_name, index = resolve_path(target.data_path)
     if obj is None: return
 
-    # Update math context
-    SAFE_MATH['frame'] = bpy.context.scene.frame_current
-    SAFE_MATH['time'] = bpy.context.scene.frame_current / (bpy.context.scene.render.fps or 24)
-    SAFE_MATH['x'] = input_val
+    # Prepare Context for Safe Math
+    math_ctx = SAFE_FUNCTIONS.copy()
+    math_ctx['frame'] = bpy.context.scene.frame_current
+    math_ctx['time'] = bpy.context.scene.frame_current / (bpy.context.scene.render.fps or 24)
+    math_ctx['x'] = input_val
     
     # 1. Calculate Target Value
     final_val = 0.0
     if target.expression.strip() != "":
-        try: final_val = float(eval(target.expression, {"__builtins__": None}, SAFE_MATH))
-        except: final_val = input_val
+        final_val = safe_evaluate_expression(target.expression, math_ctx)
     else:
+        # Standard Min/Max Mapping
         if use_absolute_midi: final_val = input_val * 127.0
         else: final_val = target.min_value + (input_val * (target.max_value - target.min_value))
 
@@ -161,6 +212,7 @@ def apply_to_blender(target, input_val, use_absolute_midi):
         # 3. Apply Drive Mode Logic
         if target.drive_mode == 'ACCUMULATE':
             # Motor Logic: Value += InputSpeed
+            # If Min/Max are -0.1 to 0.1, key release (0) = -0.1 speed (reverse).
             new_val = current_val + final_val
         else:
             # Set Logic: Value = Input
@@ -181,39 +233,50 @@ def apply_to_blender(target, input_val, use_absolute_midi):
     except Exception: pass
 
 # ==============================================================================
-# SECTION 2: MIDI PROCESSING & LOOP
+# SECTION 3: MIDI POLLING
 # ==============================================================================
 
-def midi_callback(message):
-    """Runs in a separate thread. Puts raw MIDI messages into a thread-safe queue."""
-    if message.type == 'control_change':
-        execution_queue.put(('CC', message.control, message.value))
-    elif message.type == 'note_on':
-        execution_queue.put(('Note', message.note, message.velocity))
-    elif message.type == 'note_off':
-        execution_queue.put(('Note', message.note, 0))
+def process_midi_events():
+    """
+    Run on the Main Thread via a timer. 
+    Polls the MIDI buffer for new messages and updates the scene.
+    """
+    if not is_connected or midi_input is None:
+        return 0.1 # Poll slowly if disconnected
 
-def queue_processor():
-    """Runs on the Main Blender Thread. Reads queue and updates scene."""
     scene = bpy.context.scene
     
-    # 1. Update Monitor & Mappings
-    while not execution_queue.empty():
-        m_type, m_id, m_val = execution_queue.get()
-        try:
-            scene.monitor_type = m_type
-            scene.monitor_id = m_id
-            scene.monitor_val = float(m_val)
-        except: pass
+    # 1. READ PENDING MESSAGES
+    for message in midi_input.iter_pending():
+        m_type = 'None'
+        m_id = -1
+        m_val = 0
+        
+        if message.type == 'control_change':
+            m_type, m_id, m_val = 'CC', message.control, message.value
+        elif message.type == 'note_on':
+            m_type, m_id, m_val = 'Note', message.note, message.velocity
+        elif message.type == 'note_off':
+            m_type, m_id, m_val = 'Note', message.note, 0
+            
+        # Update UI Monitor (Used for Auto-Assign)
+        scene.monitor_type = m_type
+        scene.monitor_id = m_id
+        scene.monitor_val = float(m_val)
 
+        # Update Mapped Values
         for mapping in scene.midi_mappings:
             if mapping.midi_cc == m_id:
                 if mapping.use_note:
-                    if m_type == 'Note': mapping.target_value = 1.0 if m_val > 0 else 0.0
+                    # Note Mode: ON=1.0, OFF=0.0
+                    if m_type == 'Note': 
+                        mapping.target_value = 1.0 if m_val > 0 else 0.0
                 else:
-                    if m_type != 'Note': mapping.target_value = m_val / 127.0
+                    # CC Mode: Normalize 0-127 to 0.0-1.0
+                    if m_type != 'Note': 
+                        mapping.target_value = m_val / 127.0
 
-    # 2. Smooth Values & Apply to Blender
+    # 2. ANIMATION & SMOOTHING LOOP (Runs every frame)
     for i, mapping in enumerate(scene.midi_mappings):
         if i not in animation_states: animation_states[i] = mapping.target_value
         
@@ -232,57 +295,69 @@ def queue_processor():
                 current -= step
                 if current < target: current = target
         
-        # Optimize: Only apply if value changed or if we are in a continuous mode (Time/Motor)
+        # Optimization: Only write to Blender if value changed 
+        # OR if we are using continuous modes (Motor/Time)
         is_continuous = any(t.drive_mode == 'ACCUMULATE' or 'time' in t.expression or 'frame' in t.expression for t in mapping.targets)
         
         if abs(current - animation_states[i]) > 0.00001 or (is_continuous and abs(current) > 0.001):
             animation_states[i] = current
+            
+            # Apply Easing Curve
             curved_val = apply_easing(current, mapping.easing_mode)
+            
+            # Update all targets for this mapping
             for t in mapping.targets:
                 apply_to_blender(t, curved_val, mapping.use_absolute)
-        
-    # Force Redraw
+
+    # Force Viewport Redraw
     for window in bpy.context.window_manager.windows:
         for area in window.screen.areas:
             if area.type == 'VIEW_3D': area.tag_redraw()
             
-    return 0.016 # Run approx 60fps
+    return 0.016 # Run at ~60fps
 
 def start_listening(port_name):
-    import mido
     global midi_input, is_connected
     try:
         stop_listening()
-        midi_input = mido.open_input(port_name, callback=midi_callback)
+        # Open port in Polling Mode (no callback function)
+        midi_input = mido.open_input(port_name) 
         is_connected = True
-        if not bpy.app.timers.is_registered(queue_processor):
-            bpy.app.timers.register(queue_processor)
+        
+        # Register the polling timer
+        if not bpy.app.timers.is_registered(process_midi_events):
+            bpy.app.timers.register(process_midi_events)
         return True
     except: is_connected = False; return False
 
 def stop_listening():
     global midi_input, is_connected
-    if 'midi_input' in globals() and midi_input: midi_input.close(); midi_input = None
+    if midi_input: midi_input.close(); midi_input = None
     is_connected = False
-    if bpy.app.timers.is_registered(queue_processor): bpy.app.timers.unregister(queue_processor)
+    if bpy.app.timers.is_registered(process_midi_events): 
+        bpy.app.timers.unregister(process_midi_events)
 
 # ==============================================================================
-# SECTION 3: UI & PROPS
+# SECTION 4: UI & PROPERTIES
 # ==============================================================================
 
 @persistent
 def auto_select_device(dummy):
-    """Auto-connects to the first available MIDI device on load."""
-    devices = mido.get_input_names()
-    if devices and bpy.context.scene.midi_device_name == "":
-        bpy.context.scene.midi_device_name = devices[0]
-        bpy.context.scene.midi_device_enum = devices[0]
+    """Auto-connects to the first available MIDI device on startup."""
+    try:
+        devices = mido.get_input_names()
+        if devices and bpy.context.scene.midi_device_name == "":
+            bpy.context.scene.midi_device_name = devices[0]
+            bpy.context.scene.midi_device_enum = devices[0]
+    except: pass
 
 def get_midi_devices(self, context):
     items = []
-    devices = mido.get_input_names()
-    for dev in devices: items.append((dev, dev, "MIDI Device"))
-    if not items: items.append(('NONE', "No Devices Found", ""))
+    try:
+        devices = mido.get_input_names()
+        for dev in devices: items.append((dev, dev, "MIDI Device"))
+        if not items: items.append(('NONE', "No Devices Found", ""))
+    except Exception as e: items.append(('ERROR', str(e), ""))
     return items
 
 def update_device_selection(self, context):
@@ -310,11 +385,20 @@ class MidiMapping(bpy.types.PropertyGroup):
     show_expanded: bpy.props.BoolProperty(name="Show Details", default=True)
     use_absolute: bpy.props.BoolProperty(name="Abs", default=False)
     smooth_speed: bpy.props.FloatProperty(name="Speed", default=0.1, min=0.01, max=1.0)
+    
     easing_mode: bpy.props.EnumProperty(
         name="Curve",
-        items=[('LINEAR', "Linear", ""), ('QUAD_IN', "Quad In", ""), ('QUAD_OUT', "Quad Out", ""),
-               ('QUAD_INOUT', "Quad Smooth", ""), ('CUBIC_OUT', "Cubic", ""), ('EXPO_OUT', "Expo", ""),
-               ('BACK_OUT', "Back", ""), ('ELASTIC_OUT', "Elastic", ""), ('BOUNCE_OUT', "Bounce", "")],
+        items=[
+            ('LINEAR', "Linear", ""), 
+            ('QUAD_IN', "Quad In", ""), 
+            ('QUAD_OUT', "Quad Out", ""),
+            ('QUAD_INOUT', "Quad Smooth", ""), 
+            ('CUBIC_OUT', "Cubic", ""), 
+            ('EXPO_OUT', "Expo", ""),
+            ('BACK_OUT', "Back", ""), 
+            ('ELASTIC_OUT', "Elastic", ""), 
+            ('BOUNCE_OUT', "Bounce", "")
+        ],
         default='LINEAR'
     )
 
@@ -324,31 +408,32 @@ class OBJECT_PT_MidiController(bpy.types.Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'Midi'
-
+    
     def draw(self, context):
         layout = self.layout
         scene = context.scene
-        global is_connected
         
+        # Connection Box
         box = layout.box()
         row = box.row(align=True)
         if not is_connected: row.prop(scene, "midi_device_enum", text="")
         else: row.label(text=f"Connected: {scene.midi_device_name}", icon='CHECKBOX_HLT')
         
         if not is_connected: row.operator("wm.midi_connect", text="Connect", icon='PLAY') 
-        else: 
-            btn = row.operator("wm.midi_disconnect", text="Disconnect", icon='PAUSE')
-            row.alert = True
+        else: row.operator("wm.midi_disconnect", text="Disconnect", icon='PAUSE')
 
+        # Monitor Box
         box = layout.box()
-        if not is_connected: box.label(text="Status: Disconnected", icon='CANCEL') 
+        if not is_connected: box.label(text="Disconnected", icon='CANCEL') 
         elif scene.monitor_id == -1: box.label(text="Monitor: Waiting...", icon='SOUND')
-        else: box.label(text=f"Monitor: {scene.monitor_type} #{scene.monitor_id} (Val: {int(scene.monitor_val)})", icon='SOUND')
+        else: box.label(text=f"Mon: {scene.monitor_type} #{scene.monitor_id} ({int(scene.monitor_val)})", icon='SOUND')
 
+        # IO Buttons
         row = box.row(align=True)
         row.operator("wm.midi_export_json", text="Export", icon='EXPORT')
         row.operator("wm.midi_import_json", text="Import", icon='IMPORT')
 
+        # Mappings List
         layout.label(text="Mappings")
         for index, mapping in enumerate(scene.midi_mappings):
             box = layout.box()
@@ -365,10 +450,11 @@ class OBJECT_PT_MidiController(bpy.types.Panel):
                 row.prop(mapping, "midi_cc", text="ID")
                 row.prop(mapping, "use_note", text="Key")
                 row.prop(mapping, "use_absolute", text="Abs")
+                
                 row = col.row(align=True)
                 row.prop(mapping, "easing_mode", text="")
                 row.prop(mapping, "smooth_speed", text="Speed")
-
+                
                 t_col = col.column(align=True)
                 t_col.label(text="Targets:")
                 for t_index, target in enumerate(mapping.targets):
@@ -376,7 +462,7 @@ class OBJECT_PT_MidiController(bpy.types.Panel):
                     t_row = t_box.row()
                     t_row.prop(target, "data_path", text="")
                     
-                    # Smart Paste Button
+                    # Smart Paste
                     paste_op = t_row.operator("wm.midi_paste_target", text="", icon='PASTEDOWN')
                     paste_op.mapping_index = index
                     paste_op.target_index = t_index
@@ -385,7 +471,6 @@ class OBJECT_PT_MidiController(bpy.types.Panel):
                     
                     t_row = t_box.row(align=True)
                     t_row.prop(target, "drive_mode", text="")
-                    
                     if target.expression: t_row.prop(target, "expression", text="Expr", icon='SCRIPT')
                     else:
                         if not mapping.use_absolute:
@@ -397,11 +482,10 @@ class OBJECT_PT_MidiController(bpy.types.Panel):
                     else: t_box.prop(target, "expression", text="Add Math...")
 
                 col.operator("wm.midi_add_target", text="Add Target", icon='ADD').mapping_index = index
-
         layout.operator("wm.midi_add_mapping", text="New Mapping", icon='ADD')
 
 # ==============================================================================
-# SECTION 4: OPERATORS & REGISTRATION
+# SECTION 5: OPERATORS & REGISTRATION
 # ==============================================================================
 
 class MIDI_OT_Connect(bpy.types.Operator):
@@ -417,24 +501,27 @@ class MIDI_OT_Disconnect(bpy.types.Operator):
     bl_label = "Disconnect"
     def execute(self, context):
         stop_listening()
-        self.report({'INFO'}, "Disconnected")
         return {'FINISHED'}
 
 class MIDI_OT_AddMapping(bpy.types.Operator):
     bl_idname = "wm.midi_add_mapping"
-    bl_label = "Add Mapping"
+    bl_label = "Add"
     def execute(self, context):
         new_map = context.scene.midi_mappings.add()
+        
+        # AUTO-PICK FEATURE:
+        # Uses the last detected MIDI input (monitor_id) to auto-fill the new mapping.
         if context.scene.monitor_id != -1:
             new_map.midi_cc = context.scene.monitor_id
             new_map.use_note = (context.scene.monitor_type == 'Note')
             new_map.name = f"{context.scene.monitor_type} {context.scene.monitor_id}"
+            
         new_map.targets.add()
         return {'FINISHED'}
 
 class MIDI_OT_DuplicateMapping(bpy.types.Operator):
     bl_idname = "wm.midi_duplicate_mapping"
-    bl_label = "Duplicate"
+    bl_label = "Dup"
     index: bpy.props.IntProperty()
     def execute(self, context):
         src = context.scene.midi_mappings[self.index]
@@ -456,7 +543,7 @@ class MIDI_OT_DuplicateMapping(bpy.types.Operator):
 
 class MIDI_OT_RemoveMapping(bpy.types.Operator):
     bl_idname = "wm.midi_remove_mapping"
-    bl_label = "Remove"
+    bl_label = "Rem"
     index: bpy.props.IntProperty()
     def execute(self, context):
         context.scene.midi_mappings.remove(self.index)
@@ -472,17 +559,16 @@ class MIDI_OT_AddTarget(bpy.types.Operator):
 
 class MIDI_OT_RemoveTarget(bpy.types.Operator):
     bl_idname = "wm.midi_remove_target"
-    bl_label = "Remove Target"
+    bl_label = "Rem Target"
     mapping_index: bpy.props.IntProperty()
     def execute(self, context):
         targets = context.scene.midi_mappings[self.mapping_index].targets
-        if len(targets) > 0: targets.remove(len(targets)-1) 
+        if len(targets) > 0: targets.remove(len(targets)-1)
         return {'FINISHED'}
 
 class MIDI_OT_PasteTarget(bpy.types.Operator):
     bl_idname = "wm.midi_paste_target"
-    bl_label = "Paste Path"
-    bl_description = "Paste Data Path from Clipboard. If relative, attaches to Active Object."
+    bl_label = "Paste"
     mapping_index: bpy.props.IntProperty()
     target_index: bpy.props.IntProperty()
     def execute(self, context):
@@ -492,7 +578,6 @@ class MIDI_OT_PasteTarget(bpy.types.Operator):
         else:
             obj = context.active_object
             if obj: target.data_path = f'bpy.data.objects["{obj.name}"].{path}'
-            else: self.report({'WARNING'}, "Clipboard path is relative, but no Active Object found.")
         return {'FINISHED'}
 
 class MIDI_OT_ExportJSON(bpy.types.Operator, ExportHelper):
@@ -505,13 +590,13 @@ class MIDI_OT_ExportJSON(bpy.types.Operator, ExportHelper):
             targets_data = []
             for t in m.targets:
                 targets_data.append({
-                    "path": t.data_path, "min": t.min_value, "max": t.max_value,
+                    "path": t.data_path, "min": t.min_value, "max": t.max_value, 
                     "mode": t.drive_mode, "expr": t.expression
                 })
             data.append({
-                "name": m.name, "cc": m.midi_cc, "note": m.use_note,
-                "abs": m.use_absolute, "speed": m.smooth_speed, "curve": m.easing_mode,
-                "targets": targets_data
+                "name": m.name, "cc": m.midi_cc, "note": m.use_note, 
+                "abs": m.use_absolute, "speed": m.smooth_speed, 
+                "curve": m.easing_mode, "targets": targets_data
             })
         with open(self.filepath, 'w') as f: json.dump(data, f, indent=4)
         return {'FINISHED'}
@@ -520,12 +605,10 @@ class MIDI_OT_ImportJSON(bpy.types.Operator, ImportHelper):
     bl_idname = "wm.midi_import_json"
     bl_label = "Import"
     filename_ext = ".json"
-    use_selected: bpy.props.BoolProperty(name="Use Selected Object", default=True)
     def execute(self, context):
         try:
             with open(self.filepath, 'r') as f: data = json.load(f)
         except: return {'CANCELLED'}
-        active_obj = context.active_object
         for entry in data:
             nm = context.scene.midi_mappings.add()
             nm.name = entry.get("name", "Import")
@@ -536,18 +619,11 @@ class MIDI_OT_ImportJSON(bpy.types.Operator, ImportHelper):
             nm.easing_mode = entry.get("curve", 'LINEAR')
             for t_data in entry.get("targets", []):
                 nt = nm.targets.add()
+                nt.data_path = t_data.get("path", "")
                 nt.min_value = t_data.get("min", 0.0)
                 nt.max_value = t_data.get("max", 1.0)
                 nt.drive_mode = t_data.get("mode", 'SET')
                 nt.expression = t_data.get("expr", "")
-                raw_path = t_data.get("path", "")
-                if self.use_selected and active_obj and "bpy.data.objects" in raw_path:
-                    try:
-                        str_parts = raw_path.split('].', 1)
-                        if len(str_parts) > 1: nt.data_path = f'bpy.data.objects["{active_obj.name}"].{str_parts[1]}'
-                        else: nt.data_path = raw_path
-                    except: nt.data_path = raw_path
-                else: nt.data_path = raw_path
         return {'FINISHED'}
 
 classes = (MidiTarget, MidiMapping, OBJECT_PT_MidiController, MIDI_OT_Connect, MIDI_OT_Disconnect, MIDI_OT_AddMapping, MIDI_OT_DuplicateMapping, MIDI_OT_RemoveMapping, MIDI_OT_AddTarget, MIDI_OT_RemoveTarget, MIDI_OT_PasteTarget, MIDI_OT_ExportJSON, MIDI_OT_ImportJSON)
@@ -557,7 +633,6 @@ def register():
     bpy.types.Scene.midi_mappings = bpy.props.CollectionProperty(type=MidiMapping)
     bpy.types.Scene.midi_device_name = bpy.props.StringProperty()
     bpy.types.Scene.midi_device_enum = bpy.props.EnumProperty(items=get_midi_devices, update=update_device_selection)
-    bpy.types.Scene.use_manual_device_name = bpy.props.BoolProperty()
     bpy.types.Scene.monitor_type = bpy.props.StringProperty(default="None")
     bpy.types.Scene.monitor_id = bpy.props.IntProperty(default=-1)
     bpy.types.Scene.monitor_val = bpy.props.FloatProperty()

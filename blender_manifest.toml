@@ -3,7 +3,7 @@ schema_version = "1.0.0"
 # Example of manifest file for a Blender extension
 # Change the values according to your extension
 id = "SimpleMIDI"
-version = "0.1.12"
+version = "0.1.13"
 name = "SimpleMIDI"
 tagline = "Control object parameters through MIDI Input"
 maintainer = "Yadu Rajiv"

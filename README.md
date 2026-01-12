@@ -1,6 +1,6 @@
 # SimpleMIDI for Blender
 
-A simple MIDI controller addon for Blender. It allows you to map MIDI knobs/sliders/keys to any property in Blender (Object transforms, Modifier values, Colors, etc.).
+A simple MIDI controller addon for Blender. It allows you to map MIDI knobs/sliders/keys to any property in Blender (Object transforms, Modifier values, Colours, etc.).
 
 ## Installation
 

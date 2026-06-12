@@ -6,12 +6,20 @@ import math
 import json
 import ast
 import operator
+from types import SimpleNamespace
 from bpy.app.handlers import persistent
 from bpy_extras.io_utils import ImportHelper, ExportHelper
 
 # DEPENDENCIES
-import mido
-import rtmidi
+try:
+    import mido
+except Exception:
+    mido = None
+
+try:
+    import rtmidi2
+except Exception:
+    rtmidi2 = None
 
 # ==============================================================================
 # SECTION 1: SAFE MATH EVALUATOR
@@ -76,6 +84,68 @@ def safe_evaluate_expression(expression, context):
 animation_states = {} # Stores current smoothed values for interpolation
 midi_input = None     # The active MIDI port object
 is_connected = False  # Connection flag
+
+
+def get_available_midi_devices():
+    """Returns available MIDI input device names from whichever backend is available."""
+    devices = []
+    if mido is not None:
+        try:
+            devices = list(mido.get_input_names())
+        except Exception:
+            devices = []
+
+    if not devices and rtmidi2 is not None:
+        try:
+            devices = list(rtmidi2.get_in_ports())
+        except Exception:
+            devices = []
+
+    return devices
+
+
+def _parse_raw_midi_message(data):
+    """Converts a raw MIDI byte message to the minimal shape used by the existing logic."""
+    if not data or len(data) < 1:
+        return None
+
+    status = data[0] & 0xF0
+    if status == 0xB0 and len(data) >= 3:
+        return SimpleNamespace(type='control_change', control=data[1], value=data[2])
+    if status == 0x90 and len(data) >= 3:
+        return SimpleNamespace(type='note_on', note=data[1], velocity=data[2])
+    if status == 0x80 and len(data) >= 3:
+        return SimpleNamespace(type='note_off', note=data[1], velocity=data[2])
+    return None
+
+
+class Rtmidi2InputAdapter:
+    """Minimal adapter so the rest of the addon can keep using iter_pending()."""
+
+    def __init__(self, port_name):
+        if rtmidi2 is None:
+            raise RuntimeError("rtmidi2 is unavailable")
+
+        self._queue = []
+        self._midi_in = rtmidi2.MidiIn()
+        ports = list(rtmidi2.get_in_ports())
+        if port_name not in ports:
+            raise RuntimeError(f"MIDI port not found: {port_name}")
+
+        self._midi_in.callback = self._callback
+        self._midi_in.open_port(ports.index(port_name))
+
+    def _callback(self, data, _timestamp):
+        self._queue.append(data)
+
+    def iter_pending(self):
+        while self._queue:
+            parsed = _parse_raw_midi_message(self._queue.pop(0))
+            if parsed is not None:
+                yield parsed
+
+    def close(self):
+        self._midi_in.close_port()
 
 def robust_path_split(path):
     """
@@ -328,9 +398,23 @@ def start_listening(port_name):
     global midi_input, is_connected
     try:
         stop_listening()
-        # Open port in Polling Mode (no callback function)
-        midi_input = mido.open_input(port_name) 
-        is_connected = True
+
+        # Preferred path: keep the existing mido pipeline when available.
+        if mido is not None:
+            try:
+                midi_input = mido.open_input(port_name)
+                is_connected = True
+            except Exception:
+                pass
+
+        if not is_connected and rtmidi2 is not None:
+            midi_input = Rtmidi2InputAdapter(port_name)
+            is_connected = True
+
+        if not is_connected:
+            midi_input = None
+            is_connected = False
+            return False
         
         # Register the polling timer
         if not bpy.app.timers.is_registered(process_midi_events):
@@ -353,7 +437,7 @@ def stop_listening():
 def auto_select_device(dummy):
     """Auto-connects to the first available MIDI device on startup."""
     try:
-        devices = mido.get_input_names()
+        devices = get_available_midi_devices()
         if devices and bpy.context.scene.midi_device_name == "":
             bpy.context.scene.midi_device_name = devices[0]
             bpy.context.scene.midi_device_enum = devices[0]
@@ -362,7 +446,7 @@ def auto_select_device(dummy):
 def get_midi_devices(self, context):
     items = []
     try:
-        devices = mido.get_input_names()
+        devices = get_available_midi_devices()
         for dev in devices: items.append((dev, dev, "MIDI Device"))
         if not items: items.append(('NONE', "No Devices Found", ""))
     except Exception as e: items.append(('ERROR', str(e), ""))
